@@ -157,40 +157,45 @@ async def get_sentinel(geometry: dict[str, Any], lat: float) -> dict[str, Any]:
 
         out: dict[str, Any] = {"source": "Sentinel Hub Statistical API on CDSE"}
 
-        # Sentinel-2: one request per calendar year (smaller requests fail far less often).
-        s2_rows: list[dict[str, Any]] = []
-        s2_errors: list[str] = []
-        for year in range(start.year, end.year + 1):
-            y0 = dt.date(year, 1, 1)
-            y1 = min(dt.date(year, 12, 31), end)
+        # Sentinel-2 L2A (with the SCL cloud mask) only exists worldwide from late 2018; earlier
+        # years fail with "Too many execution errors" outside Europe. Start optical history in 2019.
+        s2_start = max(start, dt.date(2019, 1, 1))
+
+        async def s2_year(year: int) -> tuple[list[dict[str, Any]], str | None]:
+            y0, y1 = max(dt.date(year, 1, 1), s2_start), min(dt.date(year, 12, 31), end)
             try:
                 js = await _post_stats(client, headers,
                                        _body(geometry, "sentinel-2-l2a", S2_EVALSCRIPT, y0, y1, "P1M",
                                              {"dataFilter": {"maxCloudCoverage": 70}}))
-                s2_rows.extend(_flatten(js))
+                return _flatten(js), None
             except httpx.HTTPStatusError as e:
-                s2_errors.append(f"{year}: {e.response.status_code} {e.response.text[:160]}")
-        if s2_rows:
-            out["s2_monthly"] = s2_rows
-        if s2_errors:
-            out["s2_error"] = "; ".join(s2_errors)
+                return [], f"{year}: {e.response.status_code} {e.response.text[:160]}"
 
-        # Sentinel-1: last two years in two one-year requests.
-        s1_rows: list[dict[str, Any]] = []
-        s1_errors: list[str] = []
-        s1_start = max(start, end - dt.timedelta(days=730))
-        for y0, y1 in ((s1_start, s1_start + dt.timedelta(days=365)), (s1_start + dt.timedelta(days=366), end)):
-            if y0 >= y1:
-                continue
+        async def s1_span(y0: dt.date, y1: dt.date) -> tuple[list[dict[str, Any]], str | None]:
             try:
                 js = await _post_stats(client, headers,
                                        _body(geometry, "sentinel-1-grd", S1_EVALSCRIPT, y0, y1, "P12D",
                                              {"processing": {"orthorectify": True, "backCoeff": "GAMMA0_TERRAIN",
                                                              "demInstance": "COPERNICUS"},
                                               "dataFilter": {"acquisitionMode": "IW", "polarization": "DV"}}))
-                s1_rows.extend(_flatten(js))
+                return _flatten(js), None
             except httpx.HTTPStatusError as e:
-                s1_errors.append(f"{y0}: {e.response.status_code} {e.response.text[:160]}")
+                return [], f"{y0}: {e.response.status_code} {e.response.text[:160]}"
+
+        s1_start = max(start, end - dt.timedelta(days=730))
+        s1_mid = s1_start + dt.timedelta(days=365)
+        tasks = [s2_year(y) for y in range(s2_start.year, end.year + 1)]
+        tasks += [s1_span(s1_start, s1_mid), s1_span(s1_mid + dt.timedelta(days=1), end)]
+        results = await asyncio.gather(*tasks)  # the semaphore in _post_stats caps concurrency
+        n_s2 = end.year - s2_start.year + 1
+        s2_rows = [r for rows, _ in results[:n_s2] for r in rows]
+        s2_errors = [e for _, e in results[:n_s2] if e]
+        s1_rows = [r for rows, _ in results[n_s2:] for r in rows]
+        s1_errors = [e for _, e in results[n_s2:] if e]
+        if s2_rows:
+            out["s2_monthly"] = s2_rows
+        if s2_errors:
+            out["s2_error"] = "; ".join(s2_errors)
         if s1_rows:
             out["s1_12day"] = s1_rows
         if s1_errors:
