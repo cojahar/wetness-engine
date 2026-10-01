@@ -87,13 +87,14 @@ async def analyze(req: AnalyzeRequest, x_api_key: str | None = Header(default=No
     return await _run(field)
 
 
-# A real quarter-section-sized rectangle near Ames, Iowa, used only to check the pipeline.
+# ~64 ha rectangle on the flat Des Moines Lobe prairie north of Ames, Iowa (pothole country,
+# the classic tile-drainage landscape). Used only to check the pipeline end to end.
 SELFTEST_FIELD = {
     "type": "Feature",
-    "properties": {"name": "selftest-ames-iowa"},
+    "properties": {"name": "selftest-story-county-iowa"},
     "geometry": {
         "type": "Polygon",
-        "coordinates": [[[-93.650, 42.000], [-93.640, 42.000], [-93.640, 42.007], [-93.650, 42.007], [-93.650, 42.000]]],
+        "coordinates": [[[-93.600, 42.180], [-93.590, 42.180], [-93.590, 42.187], [-93.600, 42.187], [-93.600, 42.180]]],
     },
 }
 

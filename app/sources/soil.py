@@ -18,7 +18,8 @@ async def soilgrids_point(lon: float, lat: float) -> dict[str, Any]:
         "lon": lon,
         "lat": lat,
         "property": ["clay", "sand", "silt", "bdod", "soc"],
-        "depth": ["0-30cm", "30-60cm", "60-100cm"],
+        # SoilGrids depth labels are fixed: 0-5, 5-15, 15-30, 30-60, 60-100, 100-200 cm.
+        "depth": ["0-5cm", "5-15cm", "15-30cm", "30-60cm", "60-100cm"],
         "value": "mean",
     }
     async with httpx.AsyncClient(timeout=90) as client:
@@ -26,13 +27,23 @@ async def soilgrids_point(lon: float, lat: float) -> dict[str, Any]:
         r.raise_for_status()
         js = r.json()
     out: dict[str, Any] = {}
+    topsoil_weights = {"0-5cm": 5, "5-15cm": 10, "15-30cm": 15}
     for layer in js.get("properties", {}).get("layers", []):
         name = layer["name"]
         factor = layer.get("unit_measure", {}).get("d_factor", 1) or 1
+        top_num = top_den = 0.0
         for d in layer.get("depths", []):
             v = d.get("values", {}).get("mean")
-            if v is not None:
-                out[f"{name}_{d['label']}"] = round(v / factor, 2)
+            if v is None:
+                continue
+            out[f"{name}_{d['label']}"] = round(v / factor, 2)
+            w = topsoil_weights.get(d["label"])
+            if w:
+                top_num += (v / factor) * w
+                top_den += w
+        if top_den:
+            # thickness-weighted 0-30 cm value, the one the scoring uses
+            out[f"{name}_0-30cm"] = round(top_num / top_den, 2)
     return {"source": "SoilGrids 2.0 (ISRIC), 250 m", "values": out}
 
 
