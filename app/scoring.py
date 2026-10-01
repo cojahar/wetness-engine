@@ -35,11 +35,19 @@ def score(soil: dict[str, Any], terrain: dict[str, Any], weather: dict[str, Any]
         v = _clamp((clay - 20) / 25)  # 20% clay -> 0, 45% -> 1
         parts["soil"] = {"value": round(v, 2), "basis": f"SoilGrids topsoil clay {clay}% (proxy, no drainage class)"}
 
-    # Terrain
+    # Terrain. A depression only holds water if the soil under it is slow, so on soils
+    # SSURGO calls well drained (glacial outwash kettles, sandy ridges) terrain counts for less.
     if terrain and "depression_share" in terrain:
         v = _clamp(terrain["depression_share"] * 2 + terrain["low_relative_share"]) \
             * (0.6 if terrain["mean_slope_pct"] < 0.5 else 1.0)  # flat ground: DEM less trustworthy
-        parts["terrain"] = {"value": round(v, 2), "basis": "Copernicus 30 m depressions and low relative ground"}
+        soil_factor = 1.0
+        basis = "Copernicus 30 m depressions and low relative ground"
+        if ss:
+            poor = ss["poorly_drained_component_share"]
+            soil_factor = 1.0 if poor >= 0.5 else 0.6 if poor > 0 else 0.3
+            if soil_factor < 1.0:
+                basis += f"; damped x{soil_factor} because SSURGO soils are mostly well drained"
+        parts["terrain"] = {"value": round(v * soil_factor, 2), "basis": basis}
 
     # Climate
     seasons = weather.get("seasons") or {}
@@ -71,14 +79,18 @@ def score(soil: dict[str, Any], terrain: dict[str, Any], weather: dict[str, Any]
     if s1:
         w = max(m["low_vv_share"] for m in s1)
         sat_components.append(("max_sar_low_backscatter_share", _clamp(w / 0.2), w))
+    weights = dict(WEIGHTS)
     if sat_components:
         v = sum(c[1] for c in sat_components) / len(sat_components)
-        parts["satellite"] = {"value": round(v, 2), "basis": {c[0]: c[2] for c in sat_components}}
+        # Four signals make up the satellite component; with fewer present it earns less weight.
+        weights["satellite"] = WEIGHTS["satellite"] * len(sat_components) / 4
+        parts["satellite"] = {"value": round(v, 2), "basis": {c[0]: c[2] for c in sat_components},
+                              "signals_present": len(sat_components)}
 
-    total_w = sum(WEIGHTS[k] for k in parts)
+    total_w = sum(weights[k] for k in parts)
     if total_w == 0:
         return {"score": None, "confidence": "none", "components": parts}
-    s = sum(WEIGHTS[k] * parts[k]["value"] for k in parts) / total_w * 100
+    s = sum(weights[k] * parts[k]["value"] for k in parts) / total_w * 100
     confidence = "high" if total_w >= 0.95 and "ssurgo" in soil else "medium" if total_w >= 0.65 else "low"
     if terrain.get("mean_slope_pct", 1) < 0.5 and confidence == "high":
         confidence = "medium"  # very flat: DEM depressions unreliable
@@ -88,6 +100,6 @@ def score(soil: dict[str, Any], terrain: dict[str, Any], weather: dict[str, Any]
         "label": label,
         "confidence": confidence,
         "components": parts,
-        "weights_used": {k: WEIGHTS[k] for k in parts},
+        "weights_used": {k: round(weights[k], 3) for k in parts},
         "note": "Screening score from public data. Flags salinity, compaction and nutrient stress as wetness too; verify in the field before quoting yield impact.",
     }

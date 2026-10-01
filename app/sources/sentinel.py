@@ -7,6 +7,7 @@ Docs: https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Statistical
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import time
 from typing import Any
@@ -19,6 +20,24 @@ TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/
 STATS_URL = "https://sh.dataspace.copernicus.eu/api/v1/statistics"
 
 _token: dict[str, Any] = {"value": None, "exp": 0.0}
+# Sentinel Hub rejects bursts with "Too many execution errors"; keep requests small and few.
+_sem = asyncio.Semaphore(2)
+
+
+async def _post_stats(client: httpx.AsyncClient, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
+    """POST with up to 3 attempts on 5xx / 429, spaced 3, 6 s."""
+    last: httpx.Response | None = None
+    for attempt in range(3):
+        async with _sem:
+            r = await client.post(STATS_URL, headers=headers, json=body)
+        if r.status_code < 500 and r.status_code != 429:
+            r.raise_for_status()
+            return r.json()
+        last = r
+        await asyncio.sleep(3 * (attempt + 1))
+    assert last is not None
+    last.raise_for_status()
+    return {}
 
 S2_EVALSCRIPT = """
 //VERSION=3
@@ -137,30 +156,45 @@ async def get_sentinel(geometry: dict[str, Any], lat: float) -> dict[str, Any]:
         end = dt.date.today()
 
         out: dict[str, Any] = {"source": "Sentinel Hub Statistical API on CDSE"}
-        try:
-            r = await client.post(
-                STATS_URL, headers=headers,
-                json=_body(geometry, "sentinel-2-l2a", S2_EVALSCRIPT, start, end, "P1M",
-                           {"dataFilter": {"maxCloudCoverage": 70}}),
-            )
-            r.raise_for_status()
-            out["s2_monthly"] = _flatten(r.json())
-        except httpx.HTTPStatusError as e:
-            out["s2_error"] = f"{e.response.status_code}: {e.response.text[:300]}"
 
-        try:
-            s1_start = max(start, end - dt.timedelta(days=730))
-            r = await client.post(
-                STATS_URL, headers=headers,
-                json=_body(geometry, "sentinel-1-grd", S1_EVALSCRIPT, s1_start, end, "P12D",
-                           {"processing": {"orthorectify": True, "backCoeff": "GAMMA0_TERRAIN",
-                                           "demInstance": "COPERNICUS"},
-                            "dataFilter": {"acquisitionMode": "IW", "polarization": "DV"}}),
-            )
-            r.raise_for_status()
-            out["s1_12day"] = _flatten(r.json())
-        except httpx.HTTPStatusError as e:
-            out["s1_error"] = f"{e.response.status_code}: {e.response.text[:300]}"
+        # Sentinel-2: one request per calendar year (smaller requests fail far less often).
+        s2_rows: list[dict[str, Any]] = []
+        s2_errors: list[str] = []
+        for year in range(start.year, end.year + 1):
+            y0 = dt.date(year, 1, 1)
+            y1 = min(dt.date(year, 12, 31), end)
+            try:
+                js = await _post_stats(client, headers,
+                                       _body(geometry, "sentinel-2-l2a", S2_EVALSCRIPT, y0, y1, "P1M",
+                                             {"dataFilter": {"maxCloudCoverage": 70}}))
+                s2_rows.extend(_flatten(js))
+            except httpx.HTTPStatusError as e:
+                s2_errors.append(f"{year}: {e.response.status_code} {e.response.text[:160]}")
+        if s2_rows:
+            out["s2_monthly"] = s2_rows
+        if s2_errors:
+            out["s2_error"] = "; ".join(s2_errors)
+
+        # Sentinel-1: last two years in two one-year requests.
+        s1_rows: list[dict[str, Any]] = []
+        s1_errors: list[str] = []
+        s1_start = max(start, end - dt.timedelta(days=730))
+        for y0, y1 in ((s1_start, s1_start + dt.timedelta(days=365)), (s1_start + dt.timedelta(days=366), end)):
+            if y0 >= y1:
+                continue
+            try:
+                js = await _post_stats(client, headers,
+                                       _body(geometry, "sentinel-1-grd", S1_EVALSCRIPT, y0, y1, "P12D",
+                                             {"processing": {"orthorectify": True, "backCoeff": "GAMMA0_TERRAIN",
+                                                             "demInstance": "COPERNICUS"},
+                                              "dataFilter": {"acquisitionMode": "IW", "polarization": "DV"}}))
+                s1_rows.extend(_flatten(js))
+            except httpx.HTTPStatusError as e:
+                s1_errors.append(f"{y0}: {e.response.status_code} {e.response.text[:160]}")
+        if s1_rows:
+            out["s1_12day"] = s1_rows
+        if s1_errors:
+            out["s1_error"] = "; ".join(s1_errors)
 
     out.update(_derive(out, lat))
     return out
