@@ -26,10 +26,14 @@ curl localhost:8000/selftest
 
 Environment variables: see `app/config.py`.
 
+## Deploy
+
+Hosted on Railway (project `wetness-engine`, service `engine`). Pushes to `main` deploy automatically via the Railway GitHub app. Service variables hold all secrets.
+
 ## Endpoints
 
 - `GET /health`
-- `GET /selftest` runs the whole pipeline on a known Iowa field and reports which sources work
+- `GET /selftest` runs the whole pipeline on a known Iowa field and reports which sources work; `?background=true` returns at once and the result lands in `GET /selftest/last`
 - `POST /analyze` body `{"boundary": <GeoJSON>, "name": "Smith north 80"}`
 
 Set `ENGINE_API_KEY` to require an `X-API-Key` header.
