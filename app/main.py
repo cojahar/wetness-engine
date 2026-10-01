@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import time
 from typing import Any
 
@@ -99,9 +100,10 @@ SELFTEST_FIELD = {
 }
 
 
-@app.get("/selftest")
-async def selftest(x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
-    _auth(x_api_key)
+_last_selftest: dict[str, Any] = {}
+
+
+async def _selftest_job() -> dict[str, Any]:
     field = parse_field(SELFTEST_FIELD)
     res = await _run(field)
     status = {
@@ -112,6 +114,30 @@ async def selftest(x_api_key: str | None = Header(default=None)) -> dict[str, An
         "terrain": "ok" if "depression_share" in res["terrain"] else "fail",
         "sentinel": "ok" if res["sentinel"].get("s2_monthly") else ("skipped" if res["sentinel"].get("skipped") else "fail"),
     }
-    return {"status": status, "errors": res["errors"], "wetness": res["wetness"], "elapsed_s": res["elapsed_s"],
-            "detail": {k: res[k] for k in ("weather", "soil", "terrain")}, "sentinel_summary": {
-                k: res["sentinel"].get(k) for k in ("skipped", "s2_error", "s1_error", "ndvi_seasons", "surface_water_months", "s1_low_backscatter_periods")}}
+    out = {"status": status, "errors": res["errors"], "wetness": res["wetness"], "elapsed_s": res["elapsed_s"],
+           "finished_at": dt.datetime.utcnow().isoformat() + "Z",
+           "detail": {k: res[k] for k in ("weather", "soil", "terrain")}, "sentinel_summary": {
+               k: res["sentinel"].get(k) for k in ("skipped", "s2_error", "s1_error", "ndvi_seasons", "surface_water_months", "s1_low_backscatter_periods")}}
+    _last_selftest.clear()
+    _last_selftest.update(out)
+    # One-line summary in the service log so it can be read without a long HTTP call.
+    print("SELFTEST", json.dumps({"status": status, "errors": res["errors"], "score": res["wetness"].get("score"),
+                                  "confidence": res["wetness"].get("confidence"), "elapsed_s": res["elapsed_s"]}), flush=True)
+    return out
+
+
+@app.get("/selftest")
+async def selftest(x_api_key: str | None = Header(default=None), background: bool = False) -> dict[str, Any]:
+    """Run the pipeline on the known field. With ?background=true it returns at once and the
+    result lands in /selftest/last and in the service log."""
+    _auth(x_api_key)
+    if background:
+        asyncio.create_task(_selftest_job())
+        return {"started": True, "check": "/selftest/last"}
+    return await _selftest_job()
+
+
+@app.get("/selftest/last")
+async def selftest_last(x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+    _auth(x_api_key)
+    return _last_selftest or {"status": "no run yet"}
