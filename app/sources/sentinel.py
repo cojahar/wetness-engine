@@ -181,7 +181,10 @@ def _derive(out: dict[str, Any], lat: float) -> dict[str, Any]:
             key = f"{d.year}-{d.year + 1}" if d.month >= 10 else f"{d.year - 1}-{d.year}"
         if d.month in peak_months and r.get("ndvi_mean") is not None:
             by_season.setdefault(key, []).append(r)
-        if r.get("water_mean") is not None:
+        # Snow and ice score as "water" on NDWI, so in the northern hemisphere only count
+        # April to October. Southern-hemisphere cropland we serve (WA) has no snow season.
+        frost_free = (4 <= d.month <= 10) if northern else True
+        if r.get("water_mean") is not None and frost_free:
             water_months.append({"month": r["from"][:7], "water_share": round(r["water_mean"], 3)})
     seasons = {}
     for k, rs in by_season.items():
