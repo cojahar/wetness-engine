@@ -15,8 +15,9 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field as PField
 
+from . import jobs
 from .config import settings
-from .geo import parse_field
+from .geo import parse_field, square_around
 from .scoring import score
 from .sources import dem, sentinel, soil, weather
 
@@ -86,6 +87,35 @@ async def analyze(req: AnalyzeRequest, x_api_key: str | None = Header(default=No
     if field.area_ha > 2000:
         raise HTTPException(status_code=400, detail="boundary over 2000 ha; split it")
     return await _run(field)
+
+
+@app.get("/analyze/point")
+async def analyze_point(lat: float, lon: float, side_m: float = 400, name: str | None = None,
+                        x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+    """Start an analysis of a square field centred on a point (side_m metres a side).
+    Returns a job id at once; fetch the result from /jobs/{id}. Meant for quick validation
+    runs and for the 'drop a pin' flow before boundary snapping exists."""
+    _auth(x_api_key)
+    if not (50 <= side_m <= 3000):
+        raise HTTPException(status_code=400, detail="side_m must be between 50 and 3000")
+    field = square_around(lon, lat, side_m, name)
+    job_id = jobs.start(name or f"{lat:.4f},{lon:.4f}", lambda: _run(field))
+    return {"job_id": job_id, "check": f"/jobs/{job_id}", "area_ha": round(field.area_ha, 1)}
+
+
+@app.get("/jobs")
+async def list_jobs(x_api_key: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    _auth(x_api_key)
+    return jobs.summaries()
+
+
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str, x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+    _auth(x_api_key)
+    j = jobs.get(job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="no such job")
+    return j
 
 
 # ~64 ha rectangle on the flat Des Moines Lobe prairie north of Ames, Iowa (pothole country,

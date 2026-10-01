@@ -46,6 +46,20 @@ class Field:
         return mapping(self.geom_wgs84)
 
 
+def square_around(lon: float, lat: float, side_m: float, name: str | None = None) -> Field:
+    """Axis-aligned square of side_m metres centred on a WGS84 point."""
+    import math
+
+    half_lat = (side_m / 2) / 111_320.0
+    half_lon = (side_m / 2) / (111_320.0 * math.cos(math.radians(lat)))
+    geom = Polygon([
+        (lon - half_lon, lat - half_lat), (lon + half_lon, lat - half_lat),
+        (lon + half_lon, lat + half_lat), (lon - half_lon, lat + half_lat),
+        (lon - half_lon, lat - half_lat),
+    ])
+    return Field(geom_wgs84=geom, name=name)
+
+
 def parse_field(payload: dict[str, Any], name: str | None = None) -> Field:
     """Accepts a GeoJSON Feature, FeatureCollection (first feature), or bare geometry."""
     t = payload.get("type")
