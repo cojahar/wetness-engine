@@ -14,6 +14,21 @@ SDA_URL = "https://sdmdataaccess.nrcs.usda.gov/Tabular/post.rest"
 
 
 async def soilgrids_point(lon: float, lat: float) -> dict[str, Any]:
+    """Centroid query; if the 250 m pixel is a SoilGrids gap, try one pixel to the north-east.
+
+    SoilGrids allows only a handful of requests per minute, so never fan out further.
+    """
+    out = await _soilgrids_one(lon, lat)
+    if not out["values"]:
+        alt = await _soilgrids_one(lon + 0.0025, lat + 0.0022)
+        if alt["values"]:
+            alt["note"] = "centroid pixel had no data; value from the adjacent pixel"
+            return alt
+        out["note"] = "no SoilGrids data at this location"
+    return out
+
+
+async def _soilgrids_one(lon: float, lat: float) -> dict[str, Any]:
     params = {
         "lon": lon,
         "lat": lat,

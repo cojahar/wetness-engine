@@ -106,7 +106,8 @@ async def selftest(x_api_key: str | None = Header(default=None)) -> dict[str, An
     res = await _run(field)
     status = {
         "weather": "ok" if res["weather"].get("seasons") else "fail",
-        "soilgrids": "ok" if (res["soil"].get("soilgrids") or {}).get("values") else "fail",
+        "soilgrids": "ok" if (res["soil"].get("soilgrids") or {}).get("values")
+        else ("no_data" if res["soil"].get("soilgrids") else "fail"),
         "ssurgo": "ok" if res["soil"].get("ssurgo") else "fail",
         "terrain": "ok" if "depression_share" in res["terrain"] else "fail",
         "sentinel": "ok" if res["sentinel"].get("s2_monthly") else ("skipped" if res["sentinel"].get("skipped") else "fail"),
