@@ -117,8 +117,11 @@ def estimate(area_ha: float, score: float | None, zones: dict[str, Any] | None,
     rest = max(0.0, 1.0 - ps - ws)
     zones_known = "problem_share" in z
 
-    # Expected yield gain as a fraction of the whole field's gross
-    gain_frac = ps * a.problem_zone_gain + ws * a.watch_zone_gain + rest * a.whole_field_gain
+    # Expected yield gain as a fraction of the whole field's gross. Zone stress can come from
+    # sand knobs, compaction or pests as well as water, so zone gains are scaled by how
+    # plausible wetness is on this field: full weight from score 50 up, a quarter below 15.
+    plausibility = max(0.25, min(1.0, (s - 15.0) / 35.0))
+    gain_frac = (ps * a.problem_zone_gain + ws * a.watch_zone_gain) * plausibility + rest * a.whole_field_gain
     if not zones_known:
         gain_frac = a.whole_field_gain  # no map: rely on the field score alone
 
@@ -142,6 +145,7 @@ def estimate(area_ha: float, score: float | None, zones: dict[str, Any] | None,
         "crop_basis": a.crop,
         "crops": {c: {"yield_per_ac": CROPS[c]["yield"], "price_per_unit": CROPS[c]["price"]} for c in dict.fromkeys(mix)},
         "zones_used": zones_known,
+        "zone_wetness_plausibility": round(plausibility, 2),
         "overridden": bool({"yield_per_ac", "price_per_unit", "gross_per_ac"} & set(overrides)),
         "expected_yield_gain_pct": round(gain_frac * 100, 1),
         "contractor": {k: scenario(m, a.install_cost_per_ac) for k, m in zip(("low", "mid", "high"), a.scenario_multipliers)},
