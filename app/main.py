@@ -13,15 +13,17 @@ import time
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field as PField
 
-from . import economics, jobs, report
+from . import economics, jobs, report, store
 from .config import settings
 from .geo import parse_field, square_around
 from .scoring import score
 from .sources import boundary, dem, sentinel, soil, weather, zones
 
-app = FastAPI(title="Farm X wetness engine", version="0.3.0")
+app = FastAPI(title="Farm X wetness engine", version="0.4.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 class AnalyzeRequest(BaseModel):
@@ -41,6 +43,8 @@ async def health() -> dict[str, Any]:
         "time": dt.datetime.utcnow().isoformat() + "Z",
         "open_meteo_commercial": bool(settings.open_meteo_api_key),
         "cdse_configured": bool(settings.cdse_client_id and settings.cdse_client_secret),
+        "durable_jobs": store.enabled(),
+        "version": app.version,
     }
 
 

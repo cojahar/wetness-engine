@@ -10,6 +10,8 @@ import json
 import uuid
 from typing import Any, Awaitable, Callable
 
+from . import store
+
 _jobs: dict[str, dict[str, Any]] = {}
 _MAX = 200
 
@@ -32,6 +34,10 @@ def start(name: str | None, coro_factory: Callable[[], Awaitable[dict[str, Any]]
         _jobs[job_id]["finished_at"] = dt.datetime.utcnow().isoformat() + "Z"
         j = _jobs[job_id]
         r = j.get("result") or {}
+        try:
+            await asyncio.to_thread(store.save, j, _summary(j))
+        except Exception as e:  # noqa: BLE001
+            print(f"job store save failed: {type(e).__name__}: {str(e)[:120]}", flush=True)
         print("JOB", json.dumps({"id": job_id, "name": name, "status": j["status"], "error": j.get("error"),
                                  "score": (r.get("wetness") or {}).get("score"),
                                  "confidence": (r.get("wetness") or {}).get("confidence"),
@@ -54,16 +60,35 @@ def start(name: str | None, coro_factory: Callable[[], Awaitable[dict[str, Any]]
     return job_id
 
 
+def _summary(j: dict[str, Any]) -> dict[str, Any]:
+    r = j.get("result") or {}
+    w = r.get("wetness") or {}
+    f = r.get("field") or {}
+    z = r.get("zones") or {}
+    e = r.get("economics") or {}
+    c = f.get("centroid") or [None, None]
+    return {"id": j["id"], "name": j["name"], "status": j["status"], "started_at": j["started_at"],
+            "finished_at": j.get("finished_at"), "score": w.get("score"), "confidence": w.get("confidence"),
+            "label": w.get("label"), "area_ha": f.get("area_ha"), "lon": c[0], "lat": c[1],
+            "problem_share": z.get("problem_share"), "expected_yield_gain_pct": e.get("expected_yield_gain_pct"),
+            "own_plow_payback_years": ((e.get("own_plow") or {}).get("mid") or {}).get("simple_payback_years"),
+            "error": j.get("error")}
+
+
 def get(job_id: str) -> dict[str, Any] | None:
-    return _jobs.get(job_id)
+    j = _jobs.get(job_id)
+    if j is not None:
+        return j
+    j = store.load(job_id)
+    if j is not None:
+        _jobs[job_id] = j  # warm the cache
+    return j
 
 
 def summaries() -> list[dict[str, Any]]:
-    out = []
-    for j in _jobs.values():
-        r = j.get("result") or {}
-        w = r.get("wetness") or {}
-        out.append({"id": j["id"], "name": j["name"], "status": j["status"], "started_at": j["started_at"],
-                    "score": w.get("score"), "confidence": w.get("confidence"), "label": w.get("label"),
-                    "error": j.get("error")})
-    return out
+    """Running and recent jobs from memory, merged with the durable index (newest first)."""
+    mem = {j["id"]: _summary(j) for j in _jobs.values()}
+    out = dict(mem)
+    for s in store.index():
+        out.setdefault(s["id"], s)
+    return sorted(out.values(), key=lambda s: s.get("started_at") or "", reverse=True)
