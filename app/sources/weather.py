@@ -5,6 +5,7 @@ Commercial plans use the customer-* hostnames with an apikey parameter.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 from collections import defaultdict
 from typing import Any
@@ -31,22 +32,41 @@ def _archive_url() -> str:
     return "https://archive-api.open-meteo.com/v1/archive"
 
 
+class WeatherDataError(RuntimeError):
+    pass
+
+
+def _valid_fraction(raw: dict[str, Any]) -> float:
+    p = (raw.get("daily") or {}).get("precipitation_sum") or []
+    if not p:
+        return 0.0
+    return sum(1 for v in p if v is not None) / len(p)
+
+
 async def fetch_history(lon: float, lat: float, start: dt.date, end: dt.date) -> dict[str, Any]:
+    """Daily history. Open-Meteo occasionally answers 200 with every value null; we never
+    let that through as 'zero rain', so a null-heavy answer is retried once, then raised."""
     params: dict[str, Any] = {
         "latitude": lat,
         "longitude": lon,
         "start_date": start.isoformat(),
         "end_date": end.isoformat(),
         "daily": ",".join(DAILY_VARS),
-        "hourly": ",".join(HOURLY_SOIL_VARS),
         "timezone": "UTC",
     }
     if settings.open_meteo_api_key:
         params["apikey"] = settings.open_meteo_api_key
     async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.get(_archive_url(), params=params)
-        r.raise_for_status()
-        return r.json()
+        for attempt in range(2):
+            r = await client.get(_archive_url(), params=params)
+            r.raise_for_status()
+            raw = r.json()
+            frac = _valid_fraction(raw)
+            if frac >= 0.9:
+                return raw
+            if attempt == 0:
+                await asyncio.sleep(3)
+    raise WeatherDataError(f"Open-Meteo returned {frac:.0%} valid daily values; refusing to score on it")
 
 
 def summarise(raw: dict[str, Any], lat: float) -> dict[str, Any]:

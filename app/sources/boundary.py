@@ -10,6 +10,7 @@ Service: https://nassgeodata.gmu.edu/CropScape/devhelp/help.html  (bbox in EPSG:
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import math
 import re
@@ -49,8 +50,17 @@ def _cdl_years(today: dt.date) -> list[int]:
 
 async def _fetch_cdl(client: httpx.AsyncClient, year: int, bbox: tuple[float, float, float, float]) -> np.ndarray | None:
     b = ",".join(str(int(round(v))) for v in bbox)
-    r = await client.get(CDL_URL, params={"year": year, "bbox": b})
-    r.raise_for_status()
+    last_exc: Exception | None = None
+    for attempt in range(2):  # the CropScape service is intermittently slow
+        try:
+            r = await client.get(CDL_URL, params={"year": year, "bbox": b})
+            r.raise_for_status()
+            break
+        except (httpx.TimeoutException, httpx.HTTPStatusError) as e:
+            last_exc = e
+            await asyncio.sleep(2)
+    else:
+        raise last_exc  # type: ignore[misc]
     m = re.search(r"https?://[^<\s]+\.tif", r.text)
     if not m:
         return None
@@ -63,13 +73,13 @@ async def _fetch_cdl(client: httpx.AsyncClient, year: int, bbox: tuple[float, fl
     return arr
 
 
-async def snap_to_field(lon: float, lat: float, window_m: float = 1500.0, max_ha: float = 300.0,
+async def snap_to_field(lon: float, lat: float, window_m: float = 1000.0, max_ha: float = 300.0,
                         name: str | None = None) -> dict[str, Any] | None:
     x, y = _to_albers.transform(lon, lat)
     bbox = (x - window_m, y - window_m, x + window_m, y + window_m)
     years = _cdl_years(dt.date.today())
     stack: list[np.ndarray] = []
-    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(180, connect=20), follow_redirects=True) as client:
         for yr in years:
             arr = await _fetch_cdl(client, yr, bbox)
             if arr is None:
