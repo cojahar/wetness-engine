@@ -18,7 +18,11 @@ import asyncio
 import base64
 import datetime as dt
 import math
+import warnings
 from typing import Any
+
+warnings.filterwarnings("ignore", message="Mean of empty slice")
+warnings.filterwarnings("ignore", message="Dataset has no geotransform")
 
 import httpx
 import numpy as np
@@ -72,6 +76,50 @@ function evaluatePixel(samples, scenes) {
   return [nPeak > 0 ? peakMax : -9999, nSpring > 0 ? wet / nSpring : -9999, nPeak];
 }
 """
+
+
+TRUECOLOR_EVALSCRIPT = """
+//VERSION=3
+function setup() {
+  return {input: [{bands: ["B04", "B03", "B02", "dataMask"]}], output: {bands: 4, sampleType: "UINT8"}};
+}
+function evaluatePixel(s) {
+  var g = 2.8;  // simple gain; reflectances ~0-0.35 on cropland
+  return [Math.min(255, s.B04 * g * 255), Math.min(255, s.B03 * g * 255), Math.min(255, s.B02 * g * 255), s.dataMask * 255];
+}
+"""
+
+UPSCALE = 3  # report images at 10 m / 3 so a 40 ha field is ~200 px wide
+
+
+async def _fetch_truecolor(client: httpx.AsyncClient, headers: dict[str, str], geom_utm: dict[str, Any], crs_uri: str,
+                           w: int, h: int, northern: bool) -> tuple[bytes | None, str | None]:
+    """Least-cloudy recent peak-season true-colour picture of the field, PNG, UPSCALE x grid."""
+    today = dt.date.today()
+    year = today.year
+    _, _, peak, _ = _season(year, northern)
+    if today.month < peak[0] + 1:   # this season's peak not over yet: use last year
+        year -= 1
+    start, end = dt.date(year, peak[0], 1), dt.date(year, peak[-1] + 1, 1) - dt.timedelta(days=1)
+    body = {
+        "input": {
+            "bounds": {"geometry": geom_utm, "properties": {"crs": crs_uri}},
+            "data": [{"type": "sentinel-2-l2a",
+                      "dataFilter": {"timeRange": {"from": f"{start}T00:00:00Z", "to": f"{end}T23:59:59Z"},
+                                     "maxCloudCoverage": 30, "mosaickingOrder": "leastCC"}}],
+        },
+        "output": {"width": w * UPSCALE, "height": h * UPSCALE,
+                   "responses": [{"identifier": "default", "format": {"type": "image/png"}}]},
+        "evalscript": TRUECOLOR_EVALSCRIPT,
+    }
+    try:
+        async with _sem:
+            r = await client.post(PROCESS_URL, headers=headers, json=body)
+        if r.status_code != 200:
+            return None, f"{r.status_code} {r.text[:120]}"
+        return r.content, f"{start:%b}-{end:%b %Y}"
+    except httpx.HTTPError as e:
+        return None, f"{type(e).__name__}"
 
 
 def _season(year: int, northern: bool) -> tuple[dt.date, dt.date, list[int], list[int]]:
@@ -170,21 +218,24 @@ def _png(freq: np.ndarray, field_mask: np.ndarray, transform: Any, utm_crs: Any)
     dst = np.full((dh, dw), np.nan, dtype="float32")
     reproject(src, dst, src_transform=transform, src_crs=utm_crs, src_nodata=np.nan,
               dst_transform=dst_transform, dst_crs="EPSG:4326", dst_nodata=np.nan, resampling=Resampling.nearest)
-    v = np.clip(dst, 0, 1)
+    wb = rasterio.transform.array_bounds(dh, dw, dst_transform)  # (west, south, east, north)
+    return base64.b64encode(_colour_png(dst)).decode(), [round(x, 6) for x in wb]
+
+
+def _colour_png(freq: np.ndarray, alpha: int = 190) -> bytes:
+    """Colour a 0-1 raster: green (0) through yellow (0.5) to red (1); NaN transparent."""
+    dh, dw = freq.shape
+    t = np.nan_to_num(np.clip(freq, 0, 1), nan=0.0)
     rgba = np.zeros((4, dh, dw), dtype="uint8")
-    # 0 -> (46,160,67) green, 0.5 -> (255,214,0) yellow, 1 -> (200,30,30) red
-    t = np.nan_to_num(v, nan=0.0)
     r = np.where(t < 0.5, 46 + (255 - 46) * t * 2, 255 - 55 * (t - 0.5) * 2)
     g = np.where(t < 0.5, 160 + (214 - 160) * t * 2, 214 - (214 - 30) * (t - 0.5) * 2)
     b = np.where(t < 0.5, 67 - 67 * t * 2, 0 + 30 * (t - 0.5) * 2)
     rgba[0], rgba[1], rgba[2] = r.astype("uint8"), g.astype("uint8"), b.astype("uint8")
-    rgba[3] = np.where(np.isnan(dst), 0, 190).astype("uint8")
+    rgba[3] = np.where(np.isnan(freq), 0, alpha).astype("uint8")
     with MemoryFile() as mem:
         with mem.open(driver="PNG", width=dw, height=dh, count=4, dtype="uint8") as ds:
             ds.write(rgba)
-        png = mem.read()
-    wb = rasterio.transform.array_bounds(dh, dw, dst_transform)  # (west, south, east, north)
-    return base64.b64encode(png).decode(), [round(x, 6) for x in wb]
+        return mem.read()
 
 
 async def get_zones(field: Field, start_year: int = 2019) -> dict[str, Any]:
@@ -202,7 +253,10 @@ async def get_zones(field: Field, start_year: int = 2019) -> dict[str, Any]:
         if not token:
             return {"skipped": "CDSE_CLIENT_ID / CDSE_CLIENT_SECRET not set"}
         headers = {"Authorization": f"Bearer {token}"}
-        results = await asyncio.gather(*(_fetch_year(client, headers, geom_utm, crs_uri, w, h, y, northern) for y in years))
+        *results, tc = await asyncio.gather(
+            *(_fetch_year(client, headers, geom_utm, crs_uri, w, h, y, northern) for y in years),
+            _fetch_truecolor(client, headers, geom_utm, crs_uri, w, h, northern))
+        truecolor_png, truecolor_note = tc
 
     utm_crs = field.utm_crs
     field_mask = ~geometry_mask([geom_utm], out_shape=(h, w), transform=transform, invert=False)
@@ -247,7 +301,13 @@ async def get_zones(field: Field, start_year: int = 2019) -> dict[str, Any]:
         z["position"] = _compass(cx - fc.x, cy - fc.y)
     cell_ha = RES_M * RES_M / 10_000
     png, png_bounds = _png(low_freq, field_mask, transform, utm_crs)
+    # Report-grid images (UTM, UPSCALE x): overlay of the same low-frequency raster, plus the picture
+    report_freq = np.where(field_mask, np.nan_to_num(low_freq, nan=0.0), np.nan).astype("float32")
+    report_overlay = _colour_png(np.repeat(np.repeat(report_freq, UPSCALE, axis=0), UPSCALE, axis=1), alpha=150)
     return {
+        "report_overlay_png_base64": base64.b64encode(report_overlay).decode(),
+        "report_truecolor_png_base64": base64.b64encode(truecolor_png).decode() if truecolor_png else None,
+        "report_truecolor_note": truecolor_note,
         "source": "Sentinel-2 L2A via Sentinel Hub Process API on CDSE, 10 m",
         "seasons_used": used,
         "errors": errors,
