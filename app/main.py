@@ -12,10 +12,10 @@ import json
 import time
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field as PField
 
-from . import economics, jobs
+from . import economics, jobs, report
 from .config import settings
 from .geo import parse_field, square_around
 from .scoring import score
@@ -194,6 +194,34 @@ async def zones_point(lat: float, lon: float, side_m: float = 400, name: str | N
 
     job_id = jobs.start(label, job)
     return {"job_id": job_id, "check": f"/jobs/{job_id}"}
+
+
+@app.get("/jobs/{job_id}/report.pdf")
+async def job_report(job_id: str, prepared_by: str = "Farm X", x_api_key: str | None = Header(default=None)) -> Response:
+    """Customer PDF for a finished job."""
+    _auth(x_api_key)
+    j = jobs.get(job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="no such job")
+    if j["status"] != "done":
+        raise HTTPException(status_code=409, detail=f"job is {j['status']}")
+    pdf = await asyncio.to_thread(report.build_pdf, j["result"], prepared_by)
+    name = (j.get("name") or job_id).replace(" ", "_").replace(",", "_")
+    return Response(pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'inline; filename="drainage-assessment-{name}.pdf"'})
+
+
+class ReportRequest(BaseModel):
+    result: dict[str, Any] = PField(..., description="A full analysis result as returned by /analyze or /jobs/{id}.result")
+    prepared_by: str = "Farm X"
+
+
+@app.post("/report")
+async def report_from_result(req: ReportRequest, x_api_key: str | None = Header(default=None)) -> Response:
+    """Customer PDF from a stored result (the front end keeps results in its own database)."""
+    _auth(x_api_key)
+    pdf = await asyncio.to_thread(report.build_pdf, req.result, req.prepared_by)
+    return Response(pdf, media_type="application/pdf")
 
 
 @app.get("/jobs")

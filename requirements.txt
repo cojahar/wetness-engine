@@ -9,3 +9,5 @@ pydantic==2.*
 pydantic-settings==2.*
 boto3==1.35.*
 rio-cogeo==5.*
+reportlab==4.4.*
+pillow==12.*
