@@ -126,10 +126,12 @@ def _findings(res: dict[str, Any]) -> list[str]:
     if "problem_share" in z:
         pz = z.get("problem_zones") or []
         where = ", ".join(f"{p['position']} ({p['area_ha'] * HA_TO_AC:.1f} ac)" for p in pz[:4])
-        out.append(f"Mapping every season since 2019 at 10 m, {z['problem_share']:.0%} of the field "
-                   f"({z['problem_ha'] * HA_TO_AC:.1f} ac) is persistently weak or ponded"
-                   f"{' - mainly in the ' + where if where else ''}. "
-                   f"A further {z['watch_share']:.0%} is borderline.")
+        radar = " and radar" if z.get("radar_used") else ""
+        out.append(f"Checking every clear satellite pass{radar} since 2019 at 10 m, {z['problem_share']:.0%} of the field "
+                   f"({z['problem_ha'] * HA_TO_AC:.1f} ac) falls well behind the rest of the field for three weeks or more "
+                   f"in a typical season, or ponds in spring{' - mainly in the ' + where if where else ''}. "
+                   f"A further {z['watch_share']:.0%} is borderline. Across the whole field the crop averages "
+                   f"{z.get('field_mean_stress_days_per_season', 0):.0f} stress days a season.")
     return out
 
 
@@ -184,8 +186,9 @@ def build_pdf(res: dict[str, Any], prepared_by: str = "Farm X") -> bytes:
         story.append(img)
         note = zones.get("report_truecolor_note")
         story.append(Paragraph(
-            "Green: crop vigour at or above the field median every season since 2019. Yellow to red: below it in "
-            "more and more seasons. Picture: Sentinel-2" + (f", {note}" if note else "") + ". North is up.", SMALL))
+            "Green: the crop here keeps pace with the rest of the field. Yellow to red: more and more days each season "
+            "spent well below the field average, judged on every clear satellite pass since 2019 (red = 30 days or more a "
+            "season). Picture: Sentinel-2" + (f", {note}" if note else "") + ". North is up.", SMALL))
 
     # Page 2: evidence
     story.append(PageBreak())
@@ -239,9 +242,12 @@ def build_pdf(res: dict[str, Any], prepared_by: str = "Farm X") -> bytes:
     pz = zones.get("problem_zones") or []
     if pz:
         story.append(Paragraph("Persistent problem zones", H2))
-        rows = [["Where", "Area (ac)", "Area (ha)"]] + [[p["position"], f"{p['area_ha'] * HA_TO_AC:.1f}", f"{p['area_ha']:.2f}"]
-                                                       for p in pz[:10]]
-        t = Table(rows, colWidths=[1.2 * inch, 1.0 * inch, 1.0 * inch], hAlign="LEFT")
+        rows = [["Where", "Area (ac)", "Area (ha)", "Stress days / season", "Worst season", "Spring ponding"]]
+        for p in pz[:10]:
+            rows.append([p["position"], f"{p['area_ha'] * HA_TO_AC:.1f}", f"{p['area_ha']:.2f}",
+                         f"{p.get('mean_stress_days_per_season', 0):.0f}", f"{p.get('worst_season_stress_days', 0):.0f}",
+                         f"{p.get('spring_ponding_share', 0):.0%} of passes"])
+        t = Table(rows, colWidths=[0.9 * inch, 0.9 * inch, 0.9 * inch, 1.5 * inch, 1.1 * inch, 1.3 * inch], hAlign="LEFT")
         t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E8EEF2")), ("FONTSIZE", (0, 0), (-1, -1), 8.5),
                                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#C9D3DA"))]))
         story.append(t)
