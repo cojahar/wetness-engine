@@ -15,7 +15,7 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field as PField
 
-from . import jobs
+from . import economics, jobs
 from .config import settings
 from .geo import parse_field, square_around
 from .scoring import score
@@ -48,7 +48,8 @@ async def _none() -> dict[str, Any]:
     return {"skipped": "not requested"}
 
 
-async def _run(field, with_zones: bool = True) -> dict[str, Any]:
+async def _run(field, with_zones: bool = True, crop_sequence: list[str] | None = None,
+               econ_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     lon, lat = field.centroid
     t0 = time.time()
 
@@ -68,9 +69,16 @@ async def _run(field, with_zones: bool = True) -> dict[str, Any]:
     data = {name: val for name, val, _ in results}
     errors = {name: err for name, _, err in results if err}
 
+    wet = score(data["soil"], data["terrain"], data["weather"], data["sentinel"])
+    try:
+        econ = economics.estimate(field.area_ha, wet.get("score"), data["zones"], crop_sequence, econ_overrides)
+    except Exception as e:  # noqa: BLE001
+        econ = {}
+        errors["economics"] = f"{type(e).__name__}: {str(e)[:300]}"
     out = {
         "field": {"name": field.name, "centroid": [lon, lat], "area_ha": round(field.area_ha, 2), "bbox": field.bbox},
-        "wetness": score(data["soil"], data["terrain"], data["weather"], data["sentinel"]),
+        "wetness": wet,
+        "economics": econ,
         "weather": data["weather"],
         "soil": data["soil"],
         "terrain": data["terrain"],
@@ -108,24 +116,32 @@ async def get_boundary(lat: float, lon: float, x_api_key: str | None = Header(de
 
 @app.get("/analyze/point")
 async def analyze_point(lat: float, lon: float, side_m: float = 400, name: str | None = None,
-                        snap: bool = True, x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+                        snap: bool = True, install_cost_per_ac: float | None = None,
+                        own_plow_cost_per_ac: float | None = None, price_per_unit: float | None = None,
+                        yield_per_ac: float | None = None,
+                        x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
     """Start an analysis from a pin. With snap=true (default) the pin is first snapped to a
     field boundary from the USDA Cropland Data Layer; if that fails (outside the US, or not
     cropland) a square of side_m metres centred on the pin is used instead.
+    Optional economics overrides: install_cost_per_ac, own_plow_cost_per_ac, price_per_unit, yield_per_ac.
     Returns a job id at once; fetch the result from /jobs/{id}."""
     _auth(x_api_key)
     if not (50 <= side_m <= 3000):
         raise HTTPException(status_code=400, detail="side_m must be between 50 and 3000")
     label = name or f"{lat:.4f},{lon:.4f}"
+    overrides = {k: v for k, v in {"install_cost_per_ac": install_cost_per_ac, "own_plow_cost_per_ac": own_plow_cost_per_ac,
+                                   "price_per_unit": price_per_unit, "yield_per_ac": yield_per_ac}.items() if v is not None}
 
     async def job() -> dict[str, Any]:
         field = None
+        crops: list[str] | None = None
         snap_info: dict[str, Any] = {"used": False}
         if snap:
             try:
                 s = await boundary.snap_to_field(lon, lat, name=label)
                 if s and s.get("found"):
                     field = boundary.field_from_snap(s, label)
+                    crops = s.get("crop_sequence")
                     snap_info = {"used": True, **{k: v for k, v in s.items() if k != "geometry"}}
                 else:
                     snap_info = {"used": False, "reason": (s or {}).get("reason", "no CDL coverage")}
@@ -134,7 +150,7 @@ async def analyze_point(lat: float, lon: float, side_m: float = 400, name: str |
         if field is None:
             field = square_around(lon, lat, side_m, label)
             snap_info["fallback"] = f"{side_m:.0f} m square"
-        res = await _run(field)
+        res = await _run(field, crop_sequence=crops, econ_overrides=overrides)
         res["boundary"] = snap_info
         res["field"]["geometry"] = field.geojson()
         return res

@@ -42,6 +42,10 @@ def start(name: str | None, coro_factory: Callable[[], Awaitable[dict[str, Any]]
                                                     "watch_ha", "seasons_used")},
                                  "zone_positions": [(z.get("position"), z.get("area_ha"))
                                                     for z in (r.get("zones") or {}).get("problem_zones", [])][:6],
+                                 "economics": {k: (r.get("economics") or {}).get(k) for k in
+                                               ("crop_basis", "expected_yield_gain_pct")} | {
+                                     "own_plow_mid": ((r.get("economics") or {}).get("own_plow") or {}).get("mid"),
+                                     "contractor_mid": ((r.get("economics") or {}).get("contractor") or {}).get("mid")},
                                  "errors": r.get("errors"),
                                  "elapsed_s": r.get("elapsed_s")}), flush=True)
 
