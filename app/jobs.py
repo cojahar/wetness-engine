@@ -39,7 +39,8 @@ def start(name: str | None, coro_factory: Callable[[], Awaitable[dict[str, Any]]
                                  "boundary": {k: v for k, v in (r.get("boundary") or {}).items() if k != "note"},
                                  "zones": {k: v for k, v in (r.get("zones") or {}).items()
                                            if k in ("skipped", "errors", "problem_share", "watch_share", "problem_ha",
-                                                    "watch_ha", "seasons_used")},
+                                                    "watch_ha", "seasons_used", "field_mean_stress_days_per_season",
+                                                    "field_spring_ponding_share", "radar_used", "legacy_max_method")},
                                  "zone_positions": [(z.get("position"), z.get("area_ha"))
                                                     for z in (r.get("zones") or {}).get("problem_zones", [])][:6],
                                  "economics": {k: (r.get("economics") or {}).get(k) for k in
