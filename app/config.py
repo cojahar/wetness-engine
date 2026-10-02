@@ -20,5 +20,13 @@ class Settings(BaseSettings):
     # Optional shared secret so only our Supabase edge function can call /analyze.
     engine_api_key: str | None = None
 
+    # Our own object storage (Railway bucket) holding hosted rasters such as cdl/<year>.tif.
+    # When set, boundary snapping reads CDL windows from here instead of USDA's live service.
+    s3_endpoint: str | None = None
+    s3_bucket: str | None = None
+    s3_access_key_id: str | None = None
+    s3_secret_access_key: str | None = None
+    s3_region: str = "auto"
+
 
 settings = Settings()

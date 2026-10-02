@@ -14,6 +14,7 @@ import asyncio
 import datetime as dt
 import math
 import re
+import time
 from collections import deque
 from typing import Any
 
@@ -22,10 +23,12 @@ import numpy as np
 import rasterio
 from rasterio.features import shapes
 from rasterio.io import MemoryFile
+from rasterio.windows import from_bounds
 from pyproj import Transformer
 from shapely.geometry import shape, Point, mapping
 from shapely.ops import transform as shp_transform
 
+from ..config import settings
 from ..geo import Field
 
 CDL_URL = "https://nassgeodata.gmu.edu/axis2/services/CDLService/GetCDLFile"
@@ -73,11 +76,49 @@ async def _fetch_cdl(client: httpx.AsyncClient, year: int, bbox: tuple[float, fl
     return arr
 
 
-async def snap_to_field(lon: float, lat: float, window_m: float = 1000.0, max_ha: float = 300.0,
-                        name: str | None = None) -> dict[str, Any] | None:
-    x, y = _to_albers.transform(lon, lat)
-    bbox = (x - window_m, y - window_m, x + window_m, y + window_m)
-    years = _cdl_years(dt.date.today())
+_url_cache: dict[str, tuple[float, str]] = {}
+
+
+def _presigned(key: str) -> str | None:
+    """Short-lived URL for an object in our bucket; None when the bucket is not configured."""
+    if not (settings.s3_endpoint and settings.s3_bucket and settings.s3_access_key_id):
+        return None
+    now = time.time()
+    hit = _url_cache.get(key)
+    if hit and hit[0] > now + 300:
+        return hit[1]
+    import boto3  # local import: optional dependency path
+
+    client = boto3.client("s3", endpoint_url=settings.s3_endpoint, aws_access_key_id=settings.s3_access_key_id,
+                          aws_secret_access_key=settings.s3_secret_access_key, region_name=settings.s3_region)
+    url = client.generate_presigned_url("get_object", Params={"Bucket": settings.s3_bucket, "Key": key}, ExpiresIn=3600)
+    _url_cache[key] = (now + 3600, url)
+    return url
+
+
+def _read_hosted(year: int, bbox: tuple[float, float, float, float]) -> tuple[np.ndarray, Any] | None:
+    """Read a window of our hosted COG for one year via HTTP range requests. Blocking; run in a thread."""
+    url = _presigned(f"cdl/{year}.tif")
+    if not url:
+        return None
+    with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR", CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif",
+                      GDAL_HTTP_MULTIRANGE="YES", GDAL_HTTP_MERGE_CONSECUTIVE_RANGES="YES"):
+        with rasterio.open(f"/vsicurl/{url}") as ds:
+            win = from_bounds(*bbox, transform=ds.transform)
+            win = win.round_offsets().round_lengths()
+            arr = ds.read(1, window=win)
+            return arr, ds.window_transform(win)
+
+
+async def _load_cube(bbox: tuple[float, float, float, float], years: list[int]) -> tuple[list[np.ndarray], Any, str] | None:
+    """Three years of CDL for the bbox: from our bucket when hosted, else from USDA's service."""
+    if _presigned(f"cdl/{years[0]}.tif"):
+        try:
+            outs = await asyncio.gather(*(asyncio.to_thread(_read_hosted, y, bbox) for y in years))
+            if all(o is not None for o in outs):
+                return [o[0] for o in outs], outs[0][1], "hosted CDL COG"  # type: ignore[index]
+        except Exception as e:  # noqa: BLE001
+            print(f"hosted CDL read failed, falling back to USDA: {type(e).__name__}: {str(e)[:120]}", flush=True)
     stack: list[np.ndarray] = []
     async with httpx.AsyncClient(timeout=httpx.Timeout(180, connect=20), follow_redirects=True) as client:
         for yr in years:
@@ -85,7 +126,18 @@ async def snap_to_field(lon: float, lat: float, window_m: float = 1000.0, max_ha
             if arr is None:
                 return None
             stack.append(arr)
-    tr = _fetch_cdl.last_transform  # type: ignore[attr-defined]
+    return stack, _fetch_cdl.last_transform, "USDA CropScape service"  # type: ignore[attr-defined]
+
+
+async def snap_to_field(lon: float, lat: float, window_m: float = 1000.0, max_ha: float = 300.0,
+                        name: str | None = None) -> dict[str, Any] | None:
+    x, y = _to_albers.transform(lon, lat)
+    bbox = (x - window_m, y - window_m, x + window_m, y + window_m)
+    years = _cdl_years(dt.date.today())
+    loaded = await _load_cube(bbox, years)
+    if not loaded:
+        return None
+    stack, tr, source = loaded
     h = min(a.shape[0] for a in stack)
     w = min(a.shape[1] for a in stack)
     cube = np.stack([a[:h, :w] for a in stack])  # (3, h, w)
@@ -146,7 +198,7 @@ async def snap_to_field(lon: float, lat: float, window_m: float = 1000.0, max_ha
     field = Field(geom_wgs84=geom_wgs, name=name)
     return {
         "found": True,
-        "method": "CDL crop-sequence flood fill (USDA Cropland Data Layer)",
+        "method": f"CDL crop-sequence flood fill (USDA Cropland Data Layer via {source})",
         "years": years,
         "crop_sequence": [CROP_NAMES.get(c, f"class {c}") for c in seq],
         "area_ha": round(field.area_ha, 1),
