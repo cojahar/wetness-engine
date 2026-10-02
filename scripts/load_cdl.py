@@ -79,8 +79,30 @@ def unzip_tif(zpath: Path, outdir: Path) -> Path:
     return out
 
 
+def _health_server() -> None:
+    """Railway health-checks every service; answer 200 so the job is not killed while it works."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"loader alive")
+
+        def log_message(self, *a):  # silence
+            pass
+
+    port = int(os.environ.get("PORT", "8000"))
+    threading.Thread(target=HTTPServer(("0.0.0.0", port), H).serve_forever, daemon=True).start()
+
+
 def main() -> int:
+    _health_server()
+    import shutil
     years = [int(y) for y in os.environ.get("CDL_YEARS", "2025,2024,2023").split(",")]
+    log(f"disk free at {os.environ.get('WORK_DIR', '/data')}: "
+        f"{shutil.disk_usage(os.environ.get('WORK_DIR', '/') if os.path.exists(os.environ.get('WORK_DIR', '/')) else '/').free / 1e9:.1f} GB")
     work = Path(os.environ.get("WORK_DIR", "/data"))
     work.mkdir(parents=True, exist_ok=True)
     client = s3()
@@ -106,8 +128,9 @@ def main() -> int:
                            Config=TransferConfig(multipart_chunksize=64 * 1024 * 1024, max_concurrency=4))
         cog.unlink(missing_ok=True)
         log(f"done {year}")
-    log("all years loaded")
-    return 0
+    log("all years loaded; idling so the service stays healthy (delete the service when done)")
+    while True:
+        time.sleep(3600)
 
 
 if __name__ == "__main__":
