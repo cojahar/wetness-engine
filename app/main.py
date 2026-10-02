@@ -19,7 +19,7 @@ from . import jobs
 from .config import settings
 from .geo import parse_field, square_around
 from .scoring import score
-from .sources import dem, sentinel, soil, weather
+from .sources import boundary, dem, sentinel, soil, weather
 
 app = FastAPI(title="Farm X wetness engine", version="0.1.0")
 
@@ -89,18 +89,52 @@ async def analyze(req: AnalyzeRequest, x_api_key: str | None = Header(default=No
     return await _run(field)
 
 
+@app.get("/boundary")
+async def get_boundary(lat: float, lon: float, x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+    """Snap a pin to a field boundary (USA only, from the USDA Cropland Data Layer)."""
+    _auth(x_api_key)
+    try:
+        snap = await boundary.snap_to_field(lon, lat)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"boundary service failed: {type(e).__name__}: {str(e)[:200]}")
+    return snap or {"found": False, "reason": "no CDL coverage here (outside the contiguous US?)"}
+
+
 @app.get("/analyze/point")
 async def analyze_point(lat: float, lon: float, side_m: float = 400, name: str | None = None,
-                        x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
-    """Start an analysis of a square field centred on a point (side_m metres a side).
-    Returns a job id at once; fetch the result from /jobs/{id}. Meant for quick validation
-    runs and for the 'drop a pin' flow before boundary snapping exists."""
+                        snap: bool = True, x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+    """Start an analysis from a pin. With snap=true (default) the pin is first snapped to a
+    field boundary from the USDA Cropland Data Layer; if that fails (outside the US, or not
+    cropland) a square of side_m metres centred on the pin is used instead.
+    Returns a job id at once; fetch the result from /jobs/{id}."""
     _auth(x_api_key)
     if not (50 <= side_m <= 3000):
         raise HTTPException(status_code=400, detail="side_m must be between 50 and 3000")
-    field = square_around(lon, lat, side_m, name)
-    job_id = jobs.start(name or f"{lat:.4f},{lon:.4f}", lambda: _run(field))
-    return {"job_id": job_id, "check": f"/jobs/{job_id}", "area_ha": round(field.area_ha, 1)}
+    label = name or f"{lat:.4f},{lon:.4f}"
+
+    async def job() -> dict[str, Any]:
+        field = None
+        snap_info: dict[str, Any] = {"used": False}
+        if snap:
+            try:
+                s = await boundary.snap_to_field(lon, lat, name=label)
+                if s and s.get("found"):
+                    field = boundary.field_from_snap(s, label)
+                    snap_info = {"used": True, **{k: v for k, v in s.items() if k != "geometry"}}
+                else:
+                    snap_info = {"used": False, "reason": (s or {}).get("reason", "no CDL coverage")}
+            except Exception as e:  # noqa: BLE001
+                snap_info = {"used": False, "reason": f"{type(e).__name__}: {str(e)[:200]}"}
+        if field is None:
+            field = square_around(lon, lat, side_m, label)
+            snap_info["fallback"] = f"{side_m:.0f} m square"
+        res = await _run(field)
+        res["boundary"] = snap_info
+        res["field"]["geometry"] = field.geojson()
+        return res
+
+    job_id = jobs.start(label, job)
+    return {"job_id": job_id, "check": f"/jobs/{job_id}"}
 
 
 @app.get("/jobs")
