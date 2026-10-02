@@ -38,6 +38,13 @@ def _fmt_money(x: float | None) -> str:
     return f"-${-x:,.0f}" if x < 0 else f"${x:,.0f}"
 
 
+def _num(x: Any) -> float | None:
+    try:
+        return None if x in (None, "") else float(x)
+    except (TypeError, ValueError):
+        return None
+
+
 def _years(x: float | None) -> str:
     if x is None:
         return "never"
@@ -205,9 +212,10 @@ def build_pdf(res: dict[str, Any], prepared_by: str = "Farm X") -> bytes:
         story.append(Paragraph("Soil map units (USDA SSURGO)", H2))
         rows = [["Soil", "Share", "Drainage class", "Hydrologic group", "Clay %", "Slowest layer Ksat (um/s)"]]
         for c in ss["components"][:8]:
-            rows.append([c.get("compname", ""), f"{c.get('comppct_r') or 0:.0f}%", c.get("drainagecl") or "",
-                         c.get("hydgrp") or "", f"{c.get('clay_pct') or 0:.0f}",
-                         f"{c.get('ksat_min_um_s'):.1f}" if c.get("ksat_min_um_s") is not None else ""])
+            pct, clay, ksat = _num(c.get("comppct_r")), _num(c.get("clay_pct")), _num(c.get("ksat_min_um_s"))
+            rows.append([c.get("compname", ""), f"{pct:.0f}%" if pct is not None else "", c.get("drainagecl") or "",
+                         c.get("hydgrp") or "", f"{clay:.0f}" if clay is not None else "",
+                         f"{ksat:.1f}" if ksat is not None else ""])
         t = Table(rows, colWidths=[1.3 * inch, 0.6 * inch, 1.5 * inch, 1.0 * inch, 0.6 * inch, W - 5.0 * inch])
         t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E8EEF2")), ("FONTSIZE", (0, 0), (-1, -1), 8),
                                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#C9D3DA"))]))
