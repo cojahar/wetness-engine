@@ -144,7 +144,8 @@ async def list_jobs(x_api_key: str | None = Header(default=None)) -> list[dict[s
 
 
 @app.get("/jobs/{job_id}")
-async def get_job(job_id: str, x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+@app.get("/jobs/{job_id}/v/{nonce}")  # nonce defeats intermediate caches; ignored
+async def get_job(job_id: str, nonce: str | None = None, x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
     _auth(x_api_key)
     j = jobs.get(job_id)
     if not j:

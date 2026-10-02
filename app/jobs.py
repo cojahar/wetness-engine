@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import uuid
 from typing import Any, Awaitable, Callable
 
@@ -29,6 +30,14 @@ def start(name: str | None, coro_factory: Callable[[], Awaitable[dict[str, Any]]
             _jobs[job_id]["status"] = "error"
             _jobs[job_id]["error"] = f"{type(e).__name__}: {str(e)[:400]}"
         _jobs[job_id]["finished_at"] = dt.datetime.utcnow().isoformat() + "Z"
+        j = _jobs[job_id]
+        r = j.get("result") or {}
+        print("JOB", json.dumps({"id": job_id, "name": name, "status": j["status"], "error": j.get("error"),
+                                 "score": (r.get("wetness") or {}).get("score"),
+                                 "confidence": (r.get("wetness") or {}).get("confidence"),
+                                 "area_ha": (r.get("field") or {}).get("area_ha"),
+                                 "boundary": {k: v for k, v in (r.get("boundary") or {}).items() if k != "note"},
+                                 "elapsed_s": r.get("elapsed_s")}), flush=True)
 
     asyncio.create_task(runner())
     return job_id
