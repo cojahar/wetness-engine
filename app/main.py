@@ -19,9 +19,9 @@ from . import jobs
 from .config import settings
 from .geo import parse_field, square_around
 from .scoring import score
-from .sources import boundary, dem, sentinel, soil, weather
+from .sources import boundary, dem, sentinel, soil, weather, zones
 
-app = FastAPI(title="Farm X wetness engine", version="0.1.0")
+app = FastAPI(title="Farm X wetness engine", version="0.3.0")
 
 
 class AnalyzeRequest(BaseModel):
@@ -44,7 +44,11 @@ async def health() -> dict[str, Any]:
     }
 
 
-async def _run(field) -> dict[str, Any]:
+async def _none() -> dict[str, Any]:
+    return {"skipped": "not requested"}
+
+
+async def _run(field, with_zones: bool = True) -> dict[str, Any]:
     lon, lat = field.centroid
     t0 = time.time()
 
@@ -59,6 +63,7 @@ async def _run(field) -> dict[str, Any]:
         guarded("soil", soil.get_soil(lon, lat, field.wkt)),
         guarded("terrain", asyncio.to_thread(dem.analyse_terrain, field)),
         guarded("sentinel", sentinel.get_sentinel(field.geojson(), lat)),
+        guarded("zones", zones.get_zones(field) if with_zones else _none()),
     )
     data = {name: val for name, val, _ in results}
     errors = {name: err for name, _, err in results if err}
@@ -70,6 +75,7 @@ async def _run(field) -> dict[str, Any]:
         "soil": data["soil"],
         "terrain": data["terrain"],
         "sentinel": data["sentinel"],
+        "zones": data["zones"],
         "errors": errors,
         "elapsed_s": round(time.time() - t0, 1),
         "engine_version": app.version,
@@ -137,6 +143,43 @@ async def analyze_point(lat: float, lon: float, side_m: float = 400, name: str |
     return {"job_id": job_id, "check": f"/jobs/{job_id}"}
 
 
+@app.post("/zones")
+async def zones_polygon(req: AnalyzeRequest, x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+    """Within-field wet-zone map only (10 m, Sentinel-2 since 2019) for a drawn boundary."""
+    _auth(x_api_key)
+    try:
+        field = parse_field(req.boundary, req.name)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(e))
+    return await zones.get_zones(field)
+
+
+@app.get("/zones/point")
+async def zones_point(lat: float, lon: float, side_m: float = 400, name: str | None = None,
+                      x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+    """Zone map from a pin: snaps to a CDL field boundary (US), else a square. Runs as a job."""
+    _auth(x_api_key)
+    label = name or f"zones {lat:.4f},{lon:.4f}"
+
+    async def job() -> dict[str, Any]:
+        field = None
+        try:
+            s = await boundary.snap_to_field(lon, lat, name=label)
+            if s and s.get("found"):
+                field = boundary.field_from_snap(s, label)
+        except Exception:  # noqa: BLE001
+            pass
+        if field is None:
+            field = square_around(lon, lat, side_m, label)
+        t0 = time.time()
+        z = await zones.get_zones(field)
+        return {"field": {"name": label, "area_ha": round(field.area_ha, 2), "geometry": field.geojson()},
+                "zones": z, "elapsed_s": round(time.time() - t0, 1)}
+
+    job_id = jobs.start(label, job)
+    return {"job_id": job_id, "check": f"/jobs/{job_id}"}
+
+
 @app.get("/jobs")
 async def list_jobs(x_api_key: str | None = Header(default=None)) -> list[dict[str, Any]]:
     _auth(x_api_key)
@@ -170,7 +213,7 @@ _last_selftest: dict[str, Any] = {}
 
 async def _selftest_job() -> dict[str, Any]:
     field = parse_field(SELFTEST_FIELD)
-    res = await _run(field)
+    res = await _run(field, with_zones=False)
     status = {
         "weather": "ok" if res["weather"].get("seasons") else "fail",
         "soilgrids": "ok" if (res["soil"].get("soilgrids") or {}).get("values")

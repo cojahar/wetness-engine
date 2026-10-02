@@ -37,6 +37,12 @@ def start(name: str | None, coro_factory: Callable[[], Awaitable[dict[str, Any]]
                                  "confidence": (r.get("wetness") or {}).get("confidence"),
                                  "area_ha": (r.get("field") or {}).get("area_ha"),
                                  "boundary": {k: v for k, v in (r.get("boundary") or {}).items() if k != "note"},
+                                 "zones": {k: v for k, v in (r.get("zones") or {}).items()
+                                           if k in ("skipped", "errors", "problem_share", "watch_share", "problem_ha",
+                                                    "watch_ha", "seasons_used")},
+                                 "zone_positions": [(z.get("position"), z.get("area_ha"))
+                                                    for z in (r.get("zones") or {}).get("problem_zones", [])][:6],
+                                 "errors": r.get("errors"),
                                  "elapsed_s": r.get("elapsed_s")}), flush=True)
 
     asyncio.create_task(runner())
