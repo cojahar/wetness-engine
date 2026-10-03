@@ -92,13 +92,18 @@ def _findings(res: dict[str, Any]) -> list[str]:
     ss = soil.get("ssurgo") or {}
     if ss:
         share = ss.get("poorly_drained_component_share", 0)
-        names = []
-        for c in (ss.get("components") or [])[:3]:
-            if c.get("compname") and c.get("drainagecl"):
-                names.append(f"{c['compname']} ({c['drainagecl'].lower()})")
-        if names:
-            out.append(f"USDA soil survey maps this field as {', '.join(names)}. "
-                       f"{share:.0%} of the mapped soil components are somewhat poorly drained or worse.")
+        soils = ss.get("soils") or []
+        if soils:
+            names = [f"{d['compname']} ({d.get('field_share', 0):.0%}, {(d.get('drainagecl') or '').lower()})" for d in soils[:3]]
+            out.append(f"The soil survey puts most of this field on {', '.join(names)}. "
+                       f"{share:.0%} of the field is on soils rated somewhat poorly drained or worse: ground that "
+                       f"holds water in a wet spring unless it is tiled.")
+        else:
+            names = [f"{c['compname']} ({c['drainagecl'].lower()})" for c in (ss.get("components") or [])[:3]
+                     if c.get("compname") and c.get("drainagecl")]
+            if names:
+                out.append(f"USDA soil survey maps this field as {', '.join(names)}. "
+                           f"{share:.0%} of the mapped soil components are somewhat poorly drained or worse.")
     terr = res.get("terrain") or {}
     if "depression_share" in terr:
         out.append(f"Elevation data shows {terr['depression_share']:.0%} of the field sits in closed depressions "
@@ -192,7 +197,8 @@ def build_pdf(res: dict[str, Any], prepared_by: str = "Farm X") -> bytes:
 
     # Page 2: evidence
     story.append(PageBreak())
-    story.append(Paragraph("Evidence", H1))
+    story.append(Paragraph("Details for your agronomist", H1))
+    story.append(Paragraph("How the verdict on page 1 was reached. Each signal is read 0 (dry) to 1 (wet) and weighted.", SMALL))
     comps = wet.get("components") or {}
     rows = [["Signal", "Reading (0 = dry, 1 = wet)", "Weight", "Basis"]]
     for k in ("soil", "terrain", "satellite", "climate"):
@@ -211,15 +217,15 @@ def build_pdf(res: dict[str, Any], prepared_by: str = "Farm X") -> bytes:
     story.append(t)
 
     ss = (res.get("soil") or {}).get("ssurgo") or {}
-    if ss.get("components"):
-        story.append(Paragraph("Soil map units (USDA SSURGO)", H2))
-        rows = [["Soil", "Share", "Drainage class", "Hydrologic group", "Clay %", "Slowest layer Ksat (um/s)"]]
-        for c in ss["components"][:8]:
-            pct, clay, ksat = _num(c.get("comppct_r")), _num(c.get("clay_pct")), _num(c.get("ksat_min_um_s"))
-            rows.append([c.get("compname", ""), f"{pct:.0f}%" if pct is not None else "", c.get("drainagecl") or "",
-                         c.get("hydgrp") or "", f"{clay:.0f}" if clay is not None else "",
-                         f"{ksat:.1f}" if ksat is not None else ""])
-        t = Table(rows, colWidths=[1.3 * inch, 0.6 * inch, 1.5 * inch, 1.0 * inch, 0.6 * inch, W - 5.0 * inch])
+    soils = ss.get("soils") or []
+    if soils:
+        story.append(Paragraph("Soils in this field (USDA soil survey)", H2))
+        rows = [["Soil", "Share of field", "Acres", "Drainage class", "Clay %", "Slowest layer Ksat (um/s)"]]
+        for d in soils[:8]:
+            fs, clay, ksat = _num(d.get("field_share")) or 0.0, _num(d.get("clay_pct")), _num(d.get("ksat_min_um_s"))
+            rows.append([d.get("compname", ""), f"{fs:.0%}", f"{fs * area_ha * HA_TO_AC:.0f}", d.get("drainagecl") or "",
+                         f"{clay:.0f}" if clay is not None else "", f"{ksat:.1f}" if ksat is not None else ""])
+        t = Table(rows, colWidths=[1.3 * inch, 1.0 * inch, 0.6 * inch, 1.6 * inch, 0.6 * inch, W - 5.1 * inch])
         t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E8EEF2")), ("FONTSIZE", (0, 0), (-1, -1), 8),
                                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#C9D3DA"))]))
         story.append(t)
