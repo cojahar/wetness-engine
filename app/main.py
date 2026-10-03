@@ -163,6 +163,47 @@ async def analyze_point(lat: float, lon: float, side_m: float = 400, name: str |
     return {"job_id": job_id, "check": f"/jobs/{job_id}"}
 
 
+class AnalyzePolygonRequest(AnalyzeRequest):
+    install_cost_per_ac: float | None = None
+    own_plow_cost_per_ac: float | None = None
+    price_per_unit: float | None = None
+    yield_per_ac: float | None = None
+
+
+@app.post("/analyze/polygon")
+async def analyze_polygon(req: AnalyzePolygonRequest, x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+    """Start an analysis from a drawn boundary (GeoJSON). Returns a job id like /analyze/point."""
+    _auth(x_api_key)
+    try:
+        field = parse_field(req.boundary, req.name)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(e))
+    if field.area_ha > 2000:
+        raise HTTPException(status_code=400, detail="boundary over 2000 ha; split it")
+    if field.area_ha < 0.2:
+        raise HTTPException(status_code=400, detail="boundary under half an acre; draw the whole field")
+    overrides = {k: v for k, v in {"install_cost_per_ac": req.install_cost_per_ac, "own_plow_cost_per_ac": req.own_plow_cost_per_ac,
+                                   "price_per_unit": req.price_per_unit, "yield_per_ac": req.yield_per_ac}.items() if v is not None}
+    label = field.name or f"drawn field {field.area_ha:.1f} ha"
+
+    async def job() -> dict[str, Any]:
+        crops: list[str] | None = None
+        try:  # crop rotation from the hosted crop map, for the economics basis (US only)
+            lon, lat = field.centroid
+            s = await boundary.snap_to_field(lon, lat, name=label)
+            if s and s.get("found"):
+                crops = s.get("crop_sequence")
+        except Exception:  # noqa: BLE001
+            pass
+        res = await _run(field, crop_sequence=crops, econ_overrides=overrides)
+        res["boundary"] = {"used": False, "method": "drawn by the user", "crop_sequence": crops}
+        res["field"]["geometry"] = field.geojson()
+        return res
+
+    job_id = jobs.start(label, job)
+    return {"job_id": job_id, "check": f"/jobs/{job_id}"}
+
+
 @app.post("/zones")
 async def zones_polygon(req: AnalyzeRequest, x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
     """Within-field wet-zone map only (10 m, Sentinel-2 since 2019) for a drawn boundary."""
