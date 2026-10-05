@@ -64,6 +64,7 @@ MIN_ZONE_HA = 0.15
 MIN_PIXEL_COVER = 0.5
 SAR_WATER_DB, SAR_REL_DB = -17.0, -5.0
 UPSCALE = 3
+NONCROP_MAX_NDVI = 0.45    # never above this in any season = not a crop pixel (lane, yard, water)
 
 S2_EVALSCRIPT = """
 //VERSION=3
@@ -342,7 +343,7 @@ def _season_stress(arr: np.ndarray, dates: list[dt.date], field_mask: np.ndarray
     med_max = float(np.nanmedian(season_max[field_mask]))
     legacy_low = np.where(np.isnan(season_max), np.nan, (season_max < med_max - LEGACY_LOW_DELTA).astype("float32"))
     return {
-        "stress_days": stress_days_scaled, "pond": pond_share, "legacy_low": legacy_low,
+        "stress_days": stress_days_scaled, "pond": pond_share, "legacy_low": legacy_low, "season_max": season_max,
         "passes_used": len(used_dates), "window_days": round(window),
         "mean_stress_days": round(float(np.nanmean(stress_days_scaled[field_mask])), 1),
         "worst_pass": max(used_dates, key=lambda x: x[2]),
@@ -399,7 +400,7 @@ async def get_zones(field: Field, start_year: int = 2019) -> dict[str, Any]:
     utm_crs = field.utm_crs
     field_mask = ~geometry_mask([geom_utm], out_shape=(h, w), transform=transform, invert=False)
     n_field = int(field_mask.sum())
-    stress_layers, pond_layers, sar_layers, legacy_layers = [], [], [], []
+    stress_layers, pond_layers, sar_layers, legacy_layers, max_layers = [], [], [], [], []
     seasons: list[dict[str, Any]] = []
     errors: dict[str, str] = {}
     for y in years:
@@ -418,6 +419,7 @@ async def get_zones(field: Field, start_year: int = 2019) -> dict[str, Any]:
         stress_layers.append(st["stress_days"])
         pond_layers.append(st["pond"])
         legacy_layers.append(st["legacy_low"])
+        max_layers.append(st["season_max"])
         row = {"year": y, "optical_passes_used": st["passes_used"], "window_days": st["window_days"],
                "mean_stress_days": st["mean_stress_days"], "optical_pond_share": st["optical_pond_share"],
                "worst_pass": {"date": st["worst_pass"][0], "field_median_ndvi": st["worst_pass"][1],
@@ -445,6 +447,15 @@ async def get_zones(field: Field, start_year: int = 2019) -> dict[str, Any]:
         pond_sar = np.nanmean(np.stack(sar_layers), axis=0) if sar_layers else np.full((h, w), np.nan, dtype="float32")
         legacy_freq = np.nanmean(np.stack(legacy_layers), axis=0)
     pond = np.fmax(np.nan_to_num(pond_opt, nan=0.0), np.nan_to_num(pond_sar, nan=0.0))
+    # Pixels that never greened up in any season (lanes, yards, waterways, tree lines, permanent
+    # water) are not crop and must not be scored as wet crop. A spot that ponds a lot is kept.
+    with np.errstate(all="ignore"):
+        alltime_max = np.nanmax(np.stack(max_layers), axis=0)
+    noncrop = field_mask & (np.nan_to_num(alltime_max, nan=0.0) < NONCROP_MAX_NDVI) & (pond < 0.3)
+    noncrop_share = round(float(noncrop.sum()) / max(1, n_field), 3)
+    field_mask = field_mask & ~noncrop
+    n_field = max(1, int(field_mask.sum()))
+    stress_mean = np.where(field_mask, stress_mean, np.nan)
     stress_s, pond_s = _box3(stress_mean), _box3(pond)
     problem = field_mask & ((stress_s >= PROBLEM_DAYS) | (pond_s >= PROBLEM_POND))
     watch = field_mask & ~problem & ((stress_s >= WATCH_DAYS) | (pond_s >= WATCH_POND))
@@ -491,6 +502,7 @@ async def get_zones(field: Field, start_year: int = 2019) -> dict[str, Any]:
         "problem_ha": round(float(problem.sum()) * cell_ha, 2),
         "watch_ha": round(float(watch.sum()) * cell_ha, 2),
         "field_mean_stress_days_per_season": round(float(np.nanmean(stress_mean[field_mask])), 1),
+        "non_crop_share_excluded": noncrop_share,
         "field_spring_ponding_share": round(float(np.nanmean(pond[field_mask])), 3),
         "radar_used": bool(sar_layers),
         "legacy_max_method": {"problem_share": round(float(legacy_problem.sum()) / n_field, 3),
