@@ -131,6 +131,9 @@ async def _load_cube(bbox: tuple[float, float, float, float], years: list[int]) 
     return stack, _fetch_cdl.last_transform, "USDA CropScape service"  # type: ignore[attr-defined]
 
 
+_missing_cdl_years: set[int] = set()
+
+
 async def cdl_classes_on_grid(field: Field, years: list[int], dst_transform: Any, dst_crs: Any,
                               shape_hw: tuple[int, int]) -> dict[int, np.ndarray]:
     """CDL class rasters for the given years, resampled (nearest) onto the zone-map grid.
@@ -148,9 +151,12 @@ async def cdl_classes_on_grid(field: Field, years: list[int], dst_transform: Any
     bbox = (minx - 90, miny - 90, maxx + 90, maxy + 90)
 
     def one(year: int) -> np.ndarray | None:
+        if year in _missing_cdl_years:
+            return None
         try:
             got = _read_hosted(year, bbox)
         except Exception as e:  # noqa: BLE001
+            _missing_cdl_years.add(year)  # not hosted (404) or unreadable: do not retry this process
             print(f"CDL {year} not readable for zone classes: {type(e).__name__}: {str(e)[:80]}", flush=True)
             return None
         if got is None:

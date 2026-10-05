@@ -8,12 +8,15 @@ Per season we make two requests for the field at 10 m in UTM:
   radar    one band per Sentinel-1 orbit (6-12 day revisit, sees through cloud): VV gamma0
            in dB, -9999 where no data.
 
-Then, per pass, each pixel is compared with the field's median on that same date, which
-cancels planting date, crop stage and haze. A pixel is "stressed" on a date when the crop
-is at full canopy (field median NDVI >= 0.55) and the pixel is 0.10 NDVI under the median.
-Stress days per season = the sum of the intervals around stressed passes (capped at 15 d
-per pass). Ponding = share of spring passes in which the pixel read as water on optical,
-or as a dark return on radar (VV < -17 dB and 5 dB under the field median that day).
+Then, per pass, each pixel is compared with the median of its own crop (CDL class, when
+hosted; else the whole field) on that same date, which cancels planting date, crop stage,
+haze, and a merged neighbour growing a different crop. A pixel is "stressed" on a date
+when its crop is at full canopy (reference NDVI >= 0.55) and the pixel is 0.10 NDVI under
+the reference. Stress days per season = the sum of the intervals around stressed passes
+(capped at 15 d per pass). Ponding = share of spring passes in which the pixel read as
+water on optical, or as a dark return on radar (VV < -17 dB and 5 dB under the field
+median that day). Pixels CDL calls non-crop in most years, and pixels that never green up
+in any season (lanes, yards, waterways), are dropped from the field mask.
 
 Problem zone = at least 21 stress days per season on average, or ponded in a fifth of
 spring passes. Watch = 10 stress days or a tenth of passes. The old "seasonal maximum"
@@ -49,12 +52,13 @@ from shapely.geometry import mapping, shape
 from shapely.ops import transform as shp_transform, unary_union
 
 from ..geo import Field
+from . import boundary as cdl
 from .sentinel import _get_token, _sem
 
 PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
 RES_M = 10.0
 NODATA, WATER = -9999.0, -1.5
-STRESS_DELTA = 0.10        # NDVI under the same-date field median = stressed
+STRESS_DELTA = 0.10        # NDVI under the same-date reference = stressed
 CROP_MIN_NDVI = 0.55       # full canopy: below this, pixel differences are emergence/maturity, not water
 MAX_GAP_DAYS = 15.0        # a stressed pass counts for at most this many days
 PROBLEM_DAYS, WATCH_DAYS = 21.0, 10.0
@@ -293,8 +297,26 @@ def _png_wgs84(v01: np.ndarray, field_mask: np.ndarray, transform: Any, utm_crs:
     return base64.b64encode(_colour_png(dst)).decode(), [round(x, 6) for x in wb]
 
 
-def _season_stress(arr: np.ndarray, dates: list[dt.date], field_mask: np.ndarray, spring: list[int]
-                   ) -> dict[str, Any] | None:
+def _class_medians(band: np.ndarray, veg: np.ndarray, classes: np.ndarray | None) -> tuple[np.ndarray, float]:
+    """Per-pixel reference NDVI: the median of the pixel's own CDL crop class on this date when
+    that class covers at least a tenth of the field, else the whole-field median. This keeps a
+    merged neighbour with a different crop, or a split-planted field, from reading as stress."""
+    field_med = float(np.median(band[veg]))
+    ref = np.full(band.shape, field_med, dtype="float32")
+    if classes is None:
+        return ref, field_med
+    total = int(veg.sum())
+    vals, counts = np.unique(classes[veg], return_counts=True)
+    for v, c in zip(vals, counts):
+        if int(v) in cdl.NON_CROP or c < max(50, 0.10 * total):
+            continue
+        sel = classes == v
+        ref[sel] = float(np.median(band[veg & sel]))
+    return ref, field_med
+
+
+def _season_stress(arr: np.ndarray, dates: list[dt.date], field_mask: np.ndarray, spring: list[int],
+                   classes: np.ndarray | None = None) -> dict[str, Any] | None:
     """Per-pixel stress days, optical ponding share and legacy max statistic for one season."""
     n_field = int(field_mask.sum())
     h, w = field_mask.shape
@@ -323,13 +345,14 @@ def _season_stress(arr: np.ndarray, dates: list[dt.date], field_mask: np.ndarray
             pond_hits[water] += 1
         if veg.sum() < 0.3 * n_field:
             continue
-        med = float(np.median(band[veg]))
+        ref, med = _class_medians(band, veg, classes)
         season_max = np.where(veg, np.fmax(np.nan_to_num(season_max, nan=-2.0), band), season_max)
-        if med < CROP_MIN_NDVI:
+        established = clear & (ref >= CROP_MIN_NDVI)   # crop at full canopy for this pixel's own class
+        if established.sum() < 0.3 * n_field:
             continue
-        stressed = veg & (band < med - STRESS_DELTA)
-        stressed |= water  # standing water on an established crop is stress too
-        obs_days[clear] += span
+        stressed = veg & established & (band < ref - STRESS_DELTA)
+        stressed |= water & established  # standing water on an established crop is stress too
+        obs_days[established] += span
         stress_days[stressed] += span
         used_dates.append((d.isoformat(), round(med, 3), round(float(stressed.sum()) / n_field, 3)))
     if not used_dates:
@@ -399,6 +422,19 @@ async def get_zones(field: Field, start_year: int = 2019) -> dict[str, Any]:
 
     utm_crs = field.utm_crs
     field_mask = ~geometry_mask([geom_utm], out_shape=(h, w), transform=transform, invert=False)
+    # CDL crop classes per season (US, hosted years only): per-crop reference NDVI and a
+    # non-crop mask for lanes, yards, waterways and water inside the boundary.
+    try:
+        classes_by_year = await cdl.cdl_classes_on_grid(field, years, transform, utm_crs, (h, w))
+    except Exception as e:  # noqa: BLE001
+        print(f"CDL classes unavailable for zones: {type(e).__name__}: {str(e)[:80]}", flush=True)
+        classes_by_year = {}
+    cdl_noncrop_share = 0.0
+    if classes_by_year:
+        nc = np.stack([np.isin(c, list(cdl.NON_CROP)) for c in classes_by_year.values()])
+        cdl_noncrop = field_mask & (nc.mean(axis=0) >= 0.5)
+        cdl_noncrop_share = round(float(cdl_noncrop.sum()) / max(1, int(field_mask.sum())), 3)
+        field_mask = field_mask & ~cdl_noncrop
     n_field = int(field_mask.sum())
     stress_layers, pond_layers, sar_layers, legacy_layers, max_layers = [], [], [], [], []
     seasons: list[dict[str, Any]] = []
@@ -412,7 +448,7 @@ async def get_zones(field: Field, start_year: int = 2019) -> dict[str, Any]:
         if err or arr is None or not dates:
             errors[f"s2 {y}"] = err or "no passes"
             continue
-        st = _season_stress(arr, dates, field_mask, spring)
+        st = _season_stress(arr, dates, field_mask, spring, classes_by_year.get(y))
         if st is None:
             errors[f"s2 {y}"] = "no pass with a clear view of an established crop"
             continue
@@ -421,6 +457,7 @@ async def get_zones(field: Field, start_year: int = 2019) -> dict[str, Any]:
         legacy_layers.append(st["legacy_low"])
         max_layers.append(st["season_max"])
         row = {"year": y, "optical_passes_used": st["passes_used"], "window_days": st["window_days"],
+               "crop_classes_used": y in classes_by_year,
                "mean_stress_days": st["mean_stress_days"], "optical_pond_share": st["optical_pond_share"],
                "worst_pass": {"date": st["worst_pass"][0], "field_median_ndvi": st["worst_pass"][1],
                               "stressed_share": st["worst_pass"][2]},
@@ -493,7 +530,7 @@ async def get_zones(field: Field, start_year: int = 2019) -> dict[str, Any]:
     return {
         "grid": grid,
         "method": "every clear Sentinel-2 pass and every Sentinel-1 pass per season since 2019, 10 m; "
-                  "stress = pixel 0.10 NDVI under the field median on the same date while the crop is established; "
+                  "stress = pixel 0.10 NDVI under its own crop's median on the same date while the crop is established; "
                   "ponding = water on optical, or dark radar return, in spring passes",
         "seasons_used": seasons,
         "errors": errors,
@@ -503,6 +540,7 @@ async def get_zones(field: Field, start_year: int = 2019) -> dict[str, Any]:
         "watch_ha": round(float(watch.sum()) * cell_ha, 2),
         "field_mean_stress_days_per_season": round(float(np.nanmean(stress_mean[field_mask])), 1),
         "non_crop_share_excluded": noncrop_share,
+        "cdl_non_crop_share_excluded": cdl_noncrop_share,
         "field_spring_ponding_share": round(float(np.nanmean(pond[field_mask])), 3),
         "radar_used": bool(sar_layers),
         "legacy_max_method": {"problem_share": round(float(legacy_problem.sum()) / n_field, 3),
