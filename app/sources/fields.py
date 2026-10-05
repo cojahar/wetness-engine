@@ -79,9 +79,14 @@ def _open(url: str):
 
 
 _meta_cache: dict[str, Any] = {}   # parquet footer per partition, so repeat pins skip the footer read
+_sem = asyncio.Semaphore(1)        # one partition read at a time: bounds memory on a small container
 
 
 def _lookup_sync(url: str, lon: float, lat: float) -> list[dict[str, Any]]:
+    """Polygons under the pin. Reads bbox columns of the candidate row groups first (tiny),
+    then streams the geometry column in small batches and keeps only the matching rows, so
+    a 600 MB state file costs a few MB of transfer and little memory."""
+    import numpy as np
     t0 = time.time()
     with _open(url) as f:
         pf = pq.ParquetFile(f, metadata=_meta_cache.get(url))
@@ -89,7 +94,6 @@ def _lookup_sync(url: str, lon: float, lat: float) -> list[dict[str, Any]]:
         _meta_cache[url] = md
         schema = pf.schema_arrow
         names = [schema.field(i).name for i in range(len(schema))]
-        # Column indices of the bbox struct children in the parquet (leaf) schema
         leaf = [md.row_group(0).column(j).path_in_schema for j in range(md.num_columns)] if md.num_row_groups else []
         idx = {p: j for j, p in enumerate(leaf)}
         keys = {k: idx.get(k) for k in ("bbox.xmin", "bbox.ymin", "bbox.xmax", "bbox.ymax")}
@@ -100,31 +104,44 @@ def _lookup_sync(url: str, lon: float, lat: float) -> list[dict[str, Any]]:
             if all(v is not None for v in keys.values()):
                 st = {k: rg.column(j).statistics for k, j in keys.items()}  # type: ignore[arg-type]
                 if all(s is not None and s.has_min_max for s in st.values()):
-                    # A row group can hold the pin only if some polygon's bbox could span it
                     ok = (st["bbox.xmin"].min <= lon + PAD_DEG and st["bbox.xmax"].max >= lon - PAD_DEG
                           and st["bbox.ymin"].min <= lat + PAD_DEG and st["bbox.ymax"].max >= lat - PAD_DEG)
             if ok:
                 groups.append(i)
-        if not groups or len(groups) > 40:
-            return []  # no pruning possible: do not pull hundreds of MB
-        cols = [c for c in ("geometry", "bbox", "confidence", "determination:datetime", "metrics:area", "id") if c in names]
-        tbl = pf.read_row_groups(groups, columns=cols)
-    pin = Point(lon, lat)
-    out: list[dict[str, Any]] = []
-    bb = tbl.column("bbox").to_pylist() if "bbox" in cols else [None] * tbl.num_rows
-    geoms = tbl.column("geometry").to_pylist()
-    confs = tbl.column("confidence").to_pylist() if "confidence" in cols else [None] * tbl.num_rows
-    dates = tbl.column("determination:datetime").to_pylist() if "determination:datetime" in cols else [None] * tbl.num_rows
-    areas = tbl.column("metrics:area").to_pylist() if "metrics:area" in cols else [None] * tbl.num_rows
-    ids = tbl.column("id").to_pylist() if "id" in cols else [None] * tbl.num_rows
-    for g, b, c, d, a, i in zip(geoms, bb, confs, dates, areas, ids):
-        if b and not (b["xmin"] <= lon <= b["xmax"] and b["ymin"] <= lat <= b["ymax"]):
-            continue
-        geom = make_valid(from_wkb(g))
-        if not geom.contains(pin):
-            continue
-        year = str(d)[:4] if d is not None else None
-        out.append({"id": i, "year": year, "confidence": c, "area_m2": a, "geometry": geom})
+        print(f"FTW {url.rsplit('/', 1)[-1]}: {md.num_row_groups} row groups, {md.num_rows} rows, "
+              f"{len(groups)} candidate groups for pin", flush=True)
+        if not groups or len(groups) > 12:
+            return []  # no usable pruning: do not pull a whole state file
+        pin = Point(lon, lat)
+        out: list[dict[str, Any]] = []
+        extra = [c for c in ("confidence", "determination:datetime", "metrics:area", "id") if c in names]
+        for gi in groups:
+            bb = pf.read_row_group(gi, columns=["bbox"]).column("bbox").combine_chunks()
+            xmin = np.asarray(bb.field("xmin").to_numpy(zero_copy_only=False), dtype="float64")
+            xmax = np.asarray(bb.field("xmax").to_numpy(zero_copy_only=False), dtype="float64")
+            ymin = np.asarray(bb.field("ymin").to_numpy(zero_copy_only=False), dtype="float64")
+            ymax = np.asarray(bb.field("ymax").to_numpy(zero_copy_only=False), dtype="float64")
+            want = set(np.nonzero((xmin <= lon) & (xmax >= lon) & (ymin <= lat) & (ymax >= lat))[0].tolist())
+            if not want:
+                continue
+            last = max(want)
+            pos = 0
+            for batch in pf.iter_batches(batch_size=2048, row_groups=[gi], columns=["geometry", *extra]):
+                n = batch.num_rows
+                hit = [k - pos for k in want if pos <= k < pos + n]
+                if hit:
+                    sub = batch.take(hit).to_pylist()
+                    for row in sub:
+                        geom = make_valid(from_wkb(row["geometry"]))
+                        if not geom.contains(pin):
+                            continue
+                        d = row.get("determination:datetime")
+                        out.append({"id": row.get("id"), "year": str(d)[:4] if d is not None else None,
+                                    "confidence": row.get("confidence"), "area_m2": row.get("metrics:area"),
+                                    "geometry": geom})
+                pos += n
+                if pos > last:
+                    break
     out.sort(key=lambda r: (r["year"] or "", r["confidence"] or 0), reverse=True)
     for r in out:
         r["elapsed_s"] = round(time.time() - t0, 1)
@@ -138,7 +155,8 @@ async def field_at(lon: float, lat: float, state_fips: str | None = None) -> dic
         return None
     cc, name = part
     url = FTW_BASE.format(cc=cc, part=name)
-    hits = await asyncio.to_thread(_lookup_sync, url, lon, lat)
+    async with _sem:
+        hits = await asyncio.to_thread(_lookup_sync, url, lon, lat)
     good = [h for h in hits if (h["confidence"] or 0) >= MIN_CONF] or hits
     if not good:
         return None
