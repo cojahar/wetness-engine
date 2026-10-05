@@ -151,6 +151,9 @@ def _findings(res: dict[str, Any]) -> list[str]:
     elif cc.get("tiled_share_of_cropland") is not None:
         out.append(f"In {cc.get('county')} County the 2022 Census of Agriculture reports "
                    f"{cc['tiled_share_of_cropland']:.0%} of cropland as tile drained.")
+    ds = (res.get("economics") or {}).get("drainage_status")
+    if ds:
+        out.append(f"Bottom line: {ds}.")
     yc = res.get("yield_check") or {}
     if yc.get("verdict"):
         yr = f" ({yc['crop_year']} crop)" if yc.get("crop_year") else ""

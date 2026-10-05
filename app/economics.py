@@ -86,9 +86,17 @@ def _annuity_pv(annual: float, rate: float, years: int) -> float:
 
 
 def estimate(area_ha: float, score: float | None, zones: dict[str, Any] | None,
-             crop_sequence: list[str] | None = None, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Screening economics for tiling this field. All money in USD, areas reported in both ha and ac."""
+             crop_sequence: list[str] | None = None, overrides: dict[str, Any] | None = None,
+             symptoms: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Screening economics for tiling this field. All money in USD, areas reported in both ha and ac.
+
+    symptoms: {"satellite": 0-1 satellite component of the score, "stress_days": field mean stress
+    days per season, "tile_label": AgTile-US label}. Poorly drained soil only pays for tile when the
+    field is still undrained; the symptoms say whether it is, so the whole-field gain is scaled by
+    them and by the public tile map.
+    """
     overrides = overrides or {}
+    symptoms = symptoms or {}
     acres = area_ha / HA_PER_AC
     mix = _crop_mix(crop_sequence)
     # Rotation average of gross revenue and drainage response
@@ -110,7 +118,14 @@ def estimate(area_ha: float, score: float | None, zones: dict[str, Any] | None,
         a.gross_per_ac = round(gross, 0)
 
     s = float(score or 0.0)
-    a.whole_field_gain = _whole_field_gain(s, response)
+    sat = symptoms.get("satellite")
+    sd = symptoms.get("stress_days")
+    symptom = max(float(sat) if sat is not None else 0.0, min(1.0, float(sd) / 20.0) if sd is not None else 0.0)
+    symptom_known = sat is not None or sd is not None
+    symptom_factor = max(0.15, min(1.0, symptom / 0.5)) if symptom_known else 1.0
+    tile_label = str(symptoms.get("tile_label") or "")
+    tile_factor = 0.5 if tile_label == "appears tiled" else 0.75 if tile_label == "partly tiled" else 1.0
+    a.whole_field_gain = _whole_field_gain(s, response) * symptom_factor * tile_factor
     z = zones or {}
     ps = float(z.get("problem_share") or 0.0)
     ws = float(z.get("watch_share") or 0.0)
@@ -139,7 +154,19 @@ def estimate(area_ha: float, score: float | None, zones: dict[str, Any] | None,
             "yield_gain_pct_whole_field": round(gain_frac * mult * 100, 1),
         }
 
+    if tile_label == "appears tiled" and ps < 0.03 and symptom < 0.4:
+        status = "looks drained already: little symptom of excess water and the public tile map says tiled; any case for tile is the mapped wet spots"
+    elif symptom_known and symptom < 0.25 and ps < 0.03:
+        status = "few symptoms of excess water on the imagery; the soil may be wet by nature but the field is coping"
+    elif ps >= 0.05 or symptom >= 0.5:
+        status = "clear symptoms of excess water; tile has something to fix here"
+    else:
+        status = "some symptoms of excess water; worth a look in a wet spring"
     out = {
+        "drainage_status": status,
+        "symptom_strength": round(symptom, 2),
+        "symptom_factor": round(symptom_factor, 2),
+        "tile_factor": tile_factor,
         "area_ha": round(area_ha, 2),
         "area_ac": round(acres, 1),
         "crop_basis": a.crop,
@@ -156,6 +183,9 @@ def estimate(area_ha: float, score: float | None, zones: dict[str, Any] | None,
             "Agricultural Water Management 2020, North Central US: soybeans +8% in trials, +4% on producer fields, "
             "partly from earlier sowing",
             "Persistent wet spots: 30-60% loss in wet years; 40% recovery assumed on problem zones, 15% on watch zones",
+            f"Whole-field gain from the soil score is scaled by how much excess-water symptom the imagery shows "
+            f"(x{symptom_factor:.2f}) and by the public tile map (x{tile_factor:.2f}): poorly drained soil only pays "
+            f"for tile when the field is still undrained",
             "Install cost: Midwest contractor bids $800-1,500/ac (2017 forum data, inflated to a $1,200/ac default). "
             "Own-plow cost is a placeholder for the dealer to replace",
             "Prices: 2 Oct 2026 futures corn $4.99, soybeans $12.77, wheat $6.86; cash defaults net of ~$0.40 basis",
