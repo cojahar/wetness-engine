@@ -131,6 +131,40 @@ async def _load_cube(bbox: tuple[float, float, float, float], years: list[int]) 
     return stack, _fetch_cdl.last_transform, "USDA CropScape service"  # type: ignore[attr-defined]
 
 
+async def cdl_classes_on_grid(field: Field, years: list[int], dst_transform: Any, dst_crs: Any,
+                              shape_hw: tuple[int, int]) -> dict[int, np.ndarray]:
+    """CDL class rasters for the given years, resampled (nearest) onto the zone-map grid.
+
+    Only years hosted in our bucket come back; the zone map treats a missing year as "one
+    crop, whole field". Used to compare each pixel with its own crop's median and to drop
+    lanes, yards and water from the field mask.
+    """
+    from rasterio.warp import Resampling, reproject
+
+    if not _presigned("cdl/2025.tif"):
+        return {}
+    g = shp_transform(_to_albers.transform, field.geom_wgs84)
+    minx, miny, maxx, maxy = g.bounds
+    bbox = (minx - 90, miny - 90, maxx + 90, maxy + 90)
+
+    def one(year: int) -> np.ndarray | None:
+        try:
+            got = _read_hosted(year, bbox)
+        except Exception as e:  # noqa: BLE001
+            print(f"CDL {year} not readable for zone classes: {type(e).__name__}: {str(e)[:80]}", flush=True)
+            return None
+        if got is None:
+            return None
+        arr, tr = got
+        dst = np.zeros(shape_hw, dtype="uint8")
+        reproject(arr, dst, src_transform=tr, src_crs=ALBERS, src_nodata=0, dst_transform=dst_transform, dst_crs=dst_crs,
+                  dst_nodata=0, resampling=Resampling.nearest)
+        return dst
+
+    outs = await asyncio.gather(*(asyncio.to_thread(one, y) for y in years))
+    return {y: o for y, o in zip(years, outs) if o is not None}
+
+
 def _sequence_in(poly_albers, cube: np.ndarray, tr: Any) -> tuple[int, ...] | None:
     """Most common 3-year CDL crop sequence among crop pixels inside a polygon."""
     from rasterio.features import geometry_mask
