@@ -31,6 +31,7 @@ from shapely.geometry import mapping, shape
 from ..config import settings
 from ..geo import Field
 from .boundary import _presigned, _url_cache
+from .fields import county_fips
 
 AGTILE_KEY = "agtile/2020.tif"
 CENSUS_PATH = Path(__file__).resolve().parents[2] / "data" / "census_tile_2022.csv"
@@ -115,23 +116,6 @@ def census_county(fips: str | None) -> dict[str, Any] | None:
     if not rec:
         return None
     return {"source": "USDA Census of Agriculture 2022 (county tile-drained acres); next release 2027", **rec}
-
-
-async def county_fips(lon: float, lat: float) -> dict[str, Any] | None:
-    """County FIPS and name from the free US Census geocoder (no key). None outside the US."""
-    import httpx
-    params = {"x": lon, "y": lat, "benchmark": "Public_AR_Current", "vintage": "Current_Current", "format": "json",
-              "layers": "Counties"}
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get("https://geocoding.geo.census.gov/geocoder/geographies/coordinates", params=params)
-        if r.status_code != 200:
-            return None
-        js = r.json()
-    counties = ((js.get("result") or {}).get("geographies") or {}).get("Counties") or []
-    if not counties:
-        return None
-    c = counties[0]
-    return {"fips": f"{c.get('STATE', '')}{c.get('COUNTY', '')}", "county": c.get("NAME"), "state_fips": c.get("STATE")}
 
 
 async def get_tile(field: Field) -> dict[str, Any]:

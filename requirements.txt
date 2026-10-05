@@ -13,3 +13,6 @@ reportlab==4.4.*
 pillow==12.*
 python-multipart==0.0.*
 pyshp==2.3.*
+pyarrow==25.*
+fsspec==2026.*
+aiohttp==3.*

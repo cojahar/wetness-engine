@@ -1,12 +1,13 @@
-"""Snap a pin to a field boundary using the USDA Cropland Data Layer (CDL).
+"""Snap a pin to a field boundary.
 
-Idea (the same one USDA's Crop Sequence Boundaries use): a field is a block of land that
-has carried the same crop sequence for the last few years. So we pull a window of CDL
-rasters for three recent years, flood-fill outward from the pin across cells whose
-three-year sequence matches the pin's, and polygonize the result.
+First choice: a Fields of The World polygon (Sentinel-2 segmentation at 10 m, see
+fields.py). Fallback: the USDA Cropland Data Layer (CDL) crop-sequence flood fill, the
+idea behind USDA's own Crop Sequence Boundaries: a field is a block of land that carried
+the same crop sequence for the last few years, so we flood-fill outward from the pin
+across cells whose three-year sequence matches. The CDL window is also how the crop
+rotation for the economics is read, whichever boundary wins.
 
-USA only (CDL coverage). Returns None outside CONUS or when the pin is not on cropland.
-Service: https://nassgeodata.gmu.edu/CropScape/devhelp/help.html  (bbox in EPSG:5070)
+CDL is USA only. Service: https://nassgeodata.gmu.edu/CropScape/devhelp/help.html
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ from shapely.ops import transform as shp_transform
 
 from ..config import settings
 from ..geo import Field
+from . import fields as ftw
 
 CDL_URL = "https://nassgeodata.gmu.edu/axis2/services/CDLService/GetCDLFile"
 ALBERS = "EPSG:5070"
@@ -129,12 +131,80 @@ async def _load_cube(bbox: tuple[float, float, float, float], years: list[int]) 
     return stack, _fetch_cdl.last_transform, "USDA CropScape service"  # type: ignore[attr-defined]
 
 
+def _sequence_in(poly_albers, cube: np.ndarray, tr: Any) -> tuple[int, ...] | None:
+    """Most common 3-year CDL crop sequence among crop pixels inside a polygon."""
+    from rasterio.features import geometry_mask
+    h, w = cube.shape[1:]
+    m = geometry_mask([mapping(poly_albers)], out_shape=(h, w), transform=tr, invert=True)
+    if not m.any():
+        return None
+    block = cube[:, m].T
+    seqs, counts = np.unique(block, axis=0, return_counts=True)
+    crop_idx = [i for i, s in enumerate(seqs) if int(s[0]) not in NON_CROP]
+    if not crop_idx:
+        return None
+    best = max(crop_idx, key=lambda i: counts[i])
+    return tuple(int(v) for v in seqs[best])
+
+
 async def snap_to_field(lon: float, lat: float, window_m: float = 1000.0, max_ha: float = 300.0,
-                        name: str | None = None) -> dict[str, Any] | None:
+                        name: str | None = None, prefer: str = "ftw") -> dict[str, Any] | None:
+    """Field polygon under a pin.
+
+    1. Fields of The World (Sentinel-2 segmentation, 10 m, 2024/2025) when a polygon of
+       acceptable confidence contains the pin; the CDL cube is still read for the crop
+       sequence (US).
+    2. Otherwise the CDL crop-sequence flood fill (30 m, US only).
+    """
     x, y = _to_albers.transform(lon, lat)
     bbox = (x - window_m, y - window_m, x + window_m, y + window_m)
     years = _cdl_years(dt.date.today())
-    loaded = await _load_cube(bbox, years)
+    county: dict[str, Any] | None = None
+    try:
+        county = await ftw.county_fips(lon, lat)
+    except Exception:  # noqa: BLE001
+        county = None
+    ftw_hit: dict[str, Any] | None = None
+    ftw_err: str | None = None
+    if prefer == "ftw":
+        try:
+            ftw_hit = await ftw.field_at(lon, lat, (county or {}).get("state_fips"))
+        except Exception as e:  # noqa: BLE001
+            ftw_err = f"{type(e).__name__}: {str(e)[:160]}"
+    try:
+        loaded = await _load_cube(bbox, years)
+    except Exception as e:  # noqa: BLE001
+        if not ftw_hit:
+            raise
+        print(f"CDL cube unavailable (crop sequence skipped): {type(e).__name__}: {str(e)[:100]}", flush=True)
+        loaded = None
+    if ftw_hit:
+        geom_wgs = shape(ftw_hit["geometry"])
+        seq = None
+        source = None
+        if loaded:
+            stack, tr, source = loaded
+            h = min(a.shape[0] for a in stack)
+            w = min(a.shape[1] for a in stack)
+            cube = np.stack([a[:h, :w] for a in stack])
+            seq = _sequence_in(shp_transform(_to_albers.transform, geom_wgs), cube, tr)
+        field = Field(geom_wgs84=geom_wgs, name=name)
+        if field.area_ha <= max_ha:
+            return {
+                "found": True,
+                "method": f"Fields of The World field unit, {ftw_hit['year']} (Sentinel-2 segmentation at 10 m)",
+                "source": ftw_hit["source"],
+                "years": years if seq else [],
+                "crop_sequence": [CROP_NAMES.get(c, f"class {c}") for c in seq] if seq else None,
+                "crop_sequence_source": f"USDA CDL via {source}" if seq else None,
+                "area_ha": round(field.area_ha, 1),
+                "confidence": ftw_hit.get("confidence"),
+                "alternatives": ftw_hit.get("alternatives"),
+                "truncated_at_max_ha": False,
+                "geometry": mapping(geom_wgs),
+                "county": county,
+                "note": ftw_hit["note"],
+            }
     if not loaded:
         return None
     stack, tr, source = loaded
@@ -204,6 +274,8 @@ async def snap_to_field(lon: float, lat: float, window_m: float = 1000.0, max_ha
         "area_ha": round(field.area_ha, 1),
         "truncated_at_max_ha": truncated,
         "geometry": mapping(geom_wgs),
+        "county": county,
+        "ftw": "no field unit under the pin" if ftw_err is None else f"lookup failed: {ftw_err}",
         "note": "30 m raster edges; expect boundaries to be within one cell (~30 m) of the true fence line. "
                 "Adjacent fields with the identical three-year crop sequence will merge.",
     }
