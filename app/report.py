@@ -137,6 +137,24 @@ def _findings(res: dict[str, Any]) -> list[str]:
                    f"in a typical season, or ponds in spring{' - mainly in the ' + where if where else ''}. "
                    f"A further {z['watch_share']:.0%} is borderline. Across the whole field the crop averages "
                    f"{z.get('field_mean_stress_days_per_season', 0):.0f} stress days a season.")
+    t = res.get("existing_tile") or {}
+    ag = t.get("agtile") or {}
+    cc = t.get("census_county") or {}
+    if ag.get("covered"):
+        sent = (f"A public map of likely tile drainage (AgTile-US) flags {ag['tiled_share']:.0%} of this field as already "
+                f"tiled ({ag['label']}). That map is a county-level estimate, not a survey of tile lines, so your own "
+                f"knowledge of the field overrides it.")
+        if cc.get("tiled_share_of_cropland") is not None:
+            sent += (f" In {cc.get('county')} County the 2022 Census of Agriculture reports "
+                     f"{cc['tiled_share_of_cropland']:.0%} of cropland as tile drained.")
+        out.append(sent)
+    elif cc.get("tiled_share_of_cropland") is not None:
+        out.append(f"In {cc.get('county')} County the 2022 Census of Agriculture reports "
+                   f"{cc['tiled_share_of_cropland']:.0%} of cropland as tile drained.")
+    yc = res.get("yield_check") or {}
+    if yc.get("verdict"):
+        yr = f" ({yc['crop_year']} crop)" if yc.get("crop_year") else ""
+        out.append(f"Your own yield map{yr}: {yc['verdict']}")
     return out
 
 

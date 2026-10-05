@@ -20,9 +20,9 @@ from . import economics, jobs, report, store, validate
 from .config import settings
 from .geo import parse_field, square_around
 from .scoring import score
-from .sources import boundary, dem, sentinel, soil, weather, zones
+from .sources import boundary, dem, sentinel, soil, tile, weather, zones
 
-app = FastAPI(title="Farm X wetness engine", version="0.5.0")
+app = FastAPI(title="Farm X wetness engine", version="0.5.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -69,6 +69,7 @@ async def _run(field, with_zones: bool = True, crop_sequence: list[str] | None =
         guarded("terrain", asyncio.to_thread(dem.analyse_terrain, field)),
         guarded("sentinel", sentinel.get_sentinel(field.geojson(), lat)),
         guarded("zones", zones.get_zones(field) if with_zones else _none()),
+        guarded("tile", tile.get_tile(field)),
     )
     data = {name: val for name, val, _ in results}
     errors = {name: err for name, _, err in results if err}
@@ -88,6 +89,7 @@ async def _run(field, with_zones: bool = True, crop_sequence: list[str] | None =
         "terrain": data["terrain"],
         "sentinel": data["sentinel"],
         "zones": data["zones"],
+        "existing_tile": data["tile"],
         "errors": errors,
         "elapsed_s": round(time.time() - t0, 1),
         "engine_version": app.version,
