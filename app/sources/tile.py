@@ -30,7 +30,7 @@ from shapely.geometry import mapping, shape
 
 from ..config import settings
 from ..geo import Field
-from .boundary import _presigned
+from .boundary import _presigned, _url_cache
 
 AGTILE_KEY = "agtile/2020.tif"
 CENSUS_PATH = Path(__file__).resolve().parents[2] / "data" / "census_tile_2022.csv"
@@ -40,7 +40,17 @@ def agtile_share(field: Field) -> dict[str, Any] | None:
     """Share of the field's pixels flagged as tiled in AgTile-US. Blocking; run in a thread.
 
     Returns None when the raster is not hosted (bucket not configured or file not loaded).
+    GDAL caches a 404 per URL for the life of the process, so on failure the presigned URL is
+    dropped and a fresh one (new signature, new URL) is tried once.
     """
+    try:
+        return _agtile_read(field)
+    except Exception:  # noqa: BLE001
+        _url_cache.pop(AGTILE_KEY, None)
+        return _agtile_read(field)
+
+
+def _agtile_read(field: Field) -> dict[str, Any] | None:
     url = _presigned(AGTILE_KEY)
     if not url:
         return None
