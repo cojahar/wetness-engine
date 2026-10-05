@@ -468,9 +468,21 @@ async def get_zones(field: Field, start_year: int = 2019) -> dict[str, Any]:
     png, png_bounds = _png_wgs84(v01, field_mask, transform, utm_crs)
     report_v = np.where(field_mask, np.nan_to_num(v01, nan=0.0), np.nan).astype("float32")
     report_overlay = _colour_png(np.repeat(np.repeat(report_v, UPSCALE, axis=0), UPSCALE, axis=1), alpha=150)
+    # Compact per-pixel grid so a yield map can be compared against the zones later (app/validate.py)
+    import zlib
+    def _pack(a: np.ndarray) -> str:
+        return base64.b64encode(zlib.compress(a.astype("uint8").tobytes(), 6)).decode()
+    grid = {
+        "epsg": utm_crs.to_epsg(), "transform": [transform.a, transform.b, transform.c, transform.d, transform.e, transform.f],
+        "width": w, "height": h, "cell_m": RES_M,
+        "stress_days_u8_zb64": _pack(np.clip(np.nan_to_num(stress_mean, nan=0.0), 0, 255)),
+        "zone_u8_zb64": _pack(problem.astype("uint8") * 2 + watch.astype("uint8")),
+        "field_mask_zb64": _pack(field_mask),
+    }
     return {
+        "grid": grid,
         "method": "every clear Sentinel-2 pass and every Sentinel-1 pass per season since 2019, 10 m; "
-                  "stress = pixel 0.10 NDVI under the field median on the same date while the crop is at full canopy; "
+                  "stress = pixel 0.10 NDVI under the field median on the same date while the crop is established; "
                   "ponding = water on optical, or dark radar return, in spring passes",
         "seasons_used": seasons,
         "errors": errors,

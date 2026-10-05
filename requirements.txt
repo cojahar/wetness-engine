@@ -11,3 +11,5 @@ boto3==1.35.*
 rio-cogeo==5.*
 reportlab==4.4.*
 pillow==12.*
+python-multipart==0.0.*
+pyshp==2.3.*

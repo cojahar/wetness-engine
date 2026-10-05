@@ -12,17 +12,17 @@ import json
 import time
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, File, Form, Header, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field as PField
 
-from . import economics, jobs, report, store
+from . import economics, jobs, report, store, validate
 from .config import settings
 from .geo import parse_field, square_around
 from .scoring import score
 from .sources import boundary, dem, sentinel, soil, weather, zones
 
-app = FastAPI(title="Farm X wetness engine", version="0.4.0")
+app = FastAPI(title="Farm X wetness engine", version="0.5.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -254,6 +254,41 @@ async def job_report(job_id: str, prepared_by: str = "Farm X", x_api_key: str | 
     name = (j.get("name") or job_id).replace(" ", "_").replace(",", "_")
     return Response(pdf, media_type="application/pdf",
                     headers={"Content-Disposition": f'inline; filename="drainage-assessment-{name}.pdf"'})
+
+
+@app.post("/jobs/{job_id}/yield")
+async def upload_yield(job_id: str, file: UploadFile = File(...), crop_year: int | None = Form(None),
+                       units: str = Form("bu/ac"), x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+    """Compare a farmer's yield-monitor export (CSV, GeoJSON or zipped shapefile) with the zone map.
+
+    Stores the comparison on the job as result["yield_check"] so the front end and the PDF can show
+    it. This is the accuracy check: the farmer's own combine against our problem zones.
+    """
+    _auth(x_api_key)
+    j = jobs.get(job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="no such job")
+    if j["status"] != "done":
+        raise HTTPException(status_code=409, detail=f"job is {j['status']}")
+    grid = ((j.get("result") or {}).get("zones") or {}).get("grid")
+    if not grid:
+        raise HTTPException(status_code=409, detail="this job has no zone grid (older job or zone map skipped); re-run the field")
+    data = await file.read()
+    if len(data) > 60_000_000:
+        raise HTTPException(status_code=413, detail="file over 60 MB; export a single field, not the whole farm")
+    try:
+        pts, note = await asyncio.to_thread(validate.parse_points, file.filename or "upload.csv", data)
+        out = await asyncio.to_thread(validate.compare, grid, pts, units)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    out["crop_year"] = crop_year
+    out["source"] = note | {"filename": file.filename, "points_in_file": int(pts.shape[0])}
+    out["checked_at"] = dt.datetime.utcnow().isoformat() + "Z"
+    j["result"]["yield_check"] = out
+    await asyncio.to_thread(jobs.update, job_id)
+    print("YIELD", json.dumps({"id": job_id, "verdict": out["verdict"], "r": out["correlation_stress_vs_yield"],
+                               "problem_zone": out.get("problem_zone")}), flush=True)
+    return out
 
 
 class ReportRequest(BaseModel):

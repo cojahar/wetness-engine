@@ -72,6 +72,7 @@ def _summary(j: dict[str, Any]) -> dict[str, Any]:
             "label": w.get("label"), "area_ha": f.get("area_ha"), "lon": c[0], "lat": c[1],
             "problem_share": z.get("problem_share"), "expected_yield_gain_pct": e.get("expected_yield_gain_pct"),
             "own_plow_payback_years": ((e.get("own_plow") or {}).get("mid") or {}).get("simple_payback_years"),
+            "yield_checked": bool(r.get("yield_check")),
             "error": j.get("error")}
 
 
@@ -83,6 +84,17 @@ def get(job_id: str) -> dict[str, Any] | None:
     if j is not None:
         _jobs[job_id] = j  # warm the cache
     return j
+
+
+def update(job_id: str) -> None:
+    """Re-save a job after its result was changed in place (e.g. a yield check was added)."""
+    j = _jobs.get(job_id)
+    if j is None:
+        return
+    try:
+        store.save(j, _summary(j))
+    except Exception as e:  # noqa: BLE001
+        print(f"job store save failed: {type(e).__name__}: {str(e)[:120]}", flush=True)
 
 
 def summaries() -> list[dict[str, Any]]:
