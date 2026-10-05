@@ -9,14 +9,15 @@ Per season we make two requests for the field at 10 m in UTM:
            in dB, -9999 where no data.
 
 Then, per pass, each pixel is compared with the median of its own crop (CDL class, when
-hosted; else the whole field) on that same date, which cancels planting date, crop stage,
-haze, and a merged neighbour growing a different crop. A pixel is "stressed" on a date
-when its crop is at full canopy (reference NDVI >= 0.55) and the pixel is 0.10 NDVI under
-the reference. Stress days per season = the sum of the intervals around stressed passes
-(capped at 15 d per pass). Ponding = share of spring passes in which the pixel read as
-water on optical, or as a dark return on radar (VV < -17 dB and 5 dB under the field
-median that day). Pixels CDL calls non-crop in most years, and pixels that never green up
-in any season (lanes, yards, waterways), are dropped from the field mask.
+hosted; else the multi-year management unit; else the whole field) on that same date,
+which cancels planting date, crop stage, haze, and a merged neighbour growing a different
+crop. A pixel is "stressed" on a date when its crop is at full canopy (reference NDVI >=
+0.55) and the pixel is 0.10 NDVI under the reference. Stress days per season = the sum of
+the intervals around stressed passes (capped at 15 d per pass). Ponding = share of spring
+passes in which the pixel read as water on optical, or as a dark return on radar (VV <
+-17 dB and 5 dB under the field median that day). Pixels CDL calls non-crop in most
+years, and pixels that never green up in any season (lanes, yards, waterways), are
+dropped from the field mask.
 
 Problem zone = at least 21 stress days per season on average, or ponded in a fifth of
 spring passes. Watch = 10 stress days or a tenth of passes. The old "seasonal maximum"
@@ -297,10 +298,18 @@ def _png_wgs84(v01: np.ndarray, field_mask: np.ndarray, transform: Any, utm_crs:
     return base64.b64encode(_colour_png(dst)).decode(), [round(x, 6) for x in wb]
 
 
-def _class_medians(band: np.ndarray, veg: np.ndarray, classes: np.ndarray | None) -> tuple[np.ndarray, float]:
-    """Per-pixel reference NDVI: the median of the pixel's own CDL crop class on this date when
-    that class covers at least a tenth of the field, else the whole-field median. This keeps a
-    merged neighbour with a different crop, or a split-planted field, from reading as stress."""
+NO_OWN_REFERENCE = cdl.NON_CROP | {61, 176, 37}   # fallow, grass, hay: never a reference of their own
+
+
+def _class_medians(band: np.ndarray, veg: np.ndarray, classes: np.ndarray | None,
+                   codes: bool = True) -> tuple[np.ndarray, float]:
+    """Per-pixel reference NDVI: the median of the pixel's own group on this date when that
+    group covers at least a tenth of the field, else the whole-field median. Groups are CDL
+    crop classes for the season (codes=True) or multi-year management units (codes=False,
+    for seasons without a CDL yet). Fallow, grass and non-crop classes never get their own
+    reference: a drowned-out patch that CDL calls fallow must still read as stress. This
+    keeps a merged neighbour with a different crop, or a split-planted field, from reading
+    as stress."""
     field_med = float(np.median(band[veg]))
     ref = np.full(band.shape, field_med, dtype="float32")
     if classes is None:
@@ -308,7 +317,7 @@ def _class_medians(band: np.ndarray, veg: np.ndarray, classes: np.ndarray | None
     total = int(veg.sum())
     vals, counts = np.unique(classes[veg], return_counts=True)
     for v, c in zip(vals, counts):
-        if int(v) in cdl.NON_CROP or c < max(50, 0.10 * total):
+        if (codes and int(v) in NO_OWN_REFERENCE) or c < max(50, 0.10 * total):
             continue
         sel = classes == v
         ref[sel] = float(np.median(band[veg & sel]))
@@ -316,7 +325,7 @@ def _class_medians(band: np.ndarray, veg: np.ndarray, classes: np.ndarray | None
 
 
 def _season_stress(arr: np.ndarray, dates: list[dt.date], field_mask: np.ndarray, spring: list[int],
-                   classes: np.ndarray | None = None) -> dict[str, Any] | None:
+                   classes: np.ndarray | None = None, codes: bool = True) -> dict[str, Any] | None:
     """Per-pixel stress days, optical ponding share and legacy max statistic for one season."""
     n_field = int(field_mask.sum())
     h, w = field_mask.shape
@@ -345,7 +354,7 @@ def _season_stress(arr: np.ndarray, dates: list[dt.date], field_mask: np.ndarray
             pond_hits[water] += 1
         if veg.sum() < 0.3 * n_field:
             continue
-        ref, med = _class_medians(band, veg, classes)
+        ref, med = _class_medians(band, veg, classes, codes)
         season_max = np.where(veg, np.fmax(np.nan_to_num(season_max, nan=-2.0), band), season_max)
         established = clear & (ref >= CROP_MIN_NDVI)   # crop at full canopy for this pixel's own class
         if established.sum() < 0.3 * n_field:
@@ -430,6 +439,13 @@ async def get_zones(field: Field, start_year: int = 2019) -> dict[str, Any]:
         print(f"CDL classes unavailable for zones: {type(e).__name__}: {str(e)[:80]}", flush=True)
         classes_by_year = {}
     cdl_noncrop_share = 0.0
+    units: np.ndarray | None = None
+    if len(classes_by_year) >= 2:
+        # Management units: pixels with the same crop every hosted year. Stand in for crop classes
+        # in seasons that have no CDL yet (the current year, and years not hosted).
+        stack_c = np.stack(list(classes_by_year.values())).reshape(len(classes_by_year), -1).T
+        _, inv = np.unique(stack_c, axis=0, return_inverse=True)
+        units = inv.reshape(h, w).astype("int32")
     if classes_by_year:
         nc = np.stack([np.isin(c, list(cdl.NON_CROP)) for c in classes_by_year.values()])
         cdl_noncrop = field_mask & (nc.mean(axis=0) >= 0.5)
@@ -448,7 +464,10 @@ async def get_zones(field: Field, start_year: int = 2019) -> dict[str, Any]:
         if err or arr is None or not dates:
             errors[f"s2 {y}"] = err or "no passes"
             continue
-        st = _season_stress(arr, dates, field_mask, spring, classes_by_year.get(y))
+        if y in classes_by_year:
+            st = _season_stress(arr, dates, field_mask, spring, classes_by_year[y], codes=True)
+        else:
+            st = _season_stress(arr, dates, field_mask, spring, units, codes=False)
         if st is None:
             errors[f"s2 {y}"] = "no pass with a clear view of an established crop"
             continue
@@ -457,7 +476,7 @@ async def get_zones(field: Field, start_year: int = 2019) -> dict[str, Any]:
         legacy_layers.append(st["legacy_low"])
         max_layers.append(st["season_max"])
         row = {"year": y, "optical_passes_used": st["passes_used"], "window_days": st["window_days"],
-               "crop_classes_used": y in classes_by_year,
+               "reference": "CDL crop classes" if y in classes_by_year else ("management units" if units is not None else "whole field"),
                "mean_stress_days": st["mean_stress_days"], "optical_pond_share": st["optical_pond_share"],
                "worst_pass": {"date": st["worst_pass"][0], "field_median_ndvi": st["worst_pass"][1],
                               "stressed_share": st["worst_pass"][2]},
