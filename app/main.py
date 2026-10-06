@@ -22,7 +22,7 @@ from .geo import parse_field, square_around
 from .scoring import score
 from .sources import boundary, dem, hydro, sentinel, soil, tile, weather, zones
 
-app = FastAPI(title="Farm X wetness engine", version="0.6.5")
+app = FastAPI(title="Farm X wetness engine", version="0.6.6")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -299,6 +299,26 @@ async def upload_yield(job_id: str, file: UploadFile = File(...), crop_year: int
     print("YIELD", json.dumps({"id": job_id, "verdict": out["verdict"], "r": out["correlation_stress_vs_yield"],
                                "problem_zone": out.get("problem_zone")}), flush=True)
     return out
+
+
+@app.post("/jobs/{job_id}/feedback")
+async def job_feedback(job_id: str, body: dict[str, Any], x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+    """Pilot feedback from the farmer (tiled? map matches? worst year?). Any JSON body; appended to
+    result["feedback"] on the job and re-saved. This is the ground truth the thresholds get tuned on."""
+    _auth(x_api_key)
+    j = jobs.get(job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="no such job")
+    if not isinstance(body, dict) or not body:
+        raise HTTPException(status_code=422, detail="send a JSON object")
+    entry = {k: (str(v)[:2000] if not isinstance(v, (int, float, bool, type(None))) else v) for k, v in list(body.items())[:40]}
+    entry["received_at"] = dt.datetime.utcnow().isoformat() + "Z"
+    res = j.setdefault("result", {}) or {}
+    res.setdefault("feedback", []).append(entry)
+    j["result"] = res
+    await asyncio.to_thread(jobs.update, job_id)
+    print("FEEDBACK", json.dumps({"id": job_id, **{k: v for k, v in entry.items() if k != "received_at"}})[:1500], flush=True)
+    return {"ok": True, "count": len(res["feedback"])}
 
 
 class ReportRequest(BaseModel):
