@@ -35,6 +35,24 @@ NWI_URL = "https://fwspublicservices.wim.usgs.gov/wetlandsmapservice/rest/servic
 NHD_URL = "https://hydro.nationalmap.gov/arcgis/rest/services/NHDPlus_HR/MapServer/{layer}/query"
 FTYPE = {336: "canal/ditch", 460: "stream/river", 428: "pipeline", 558: "artificial path", 334: "connector",
          390: "lake/pond", 436: "reservoir", 466: "swamp/marsh", 493: "estuary"}
+# FCode refinements that matter to a tile outlet: an intermittent stream may be dry when the tile runs
+FCODE = {46006: "perennial stream", 46003: "intermittent stream", 46007: "ephemeral stream", 33600: "canal/ditch",
+         33601: "aqueduct", 33603: "stormwater ditch", 55800: "river centreline (artificial path)", 42801: "pipeline",
+         42803: "pipeline (siphon)", 42807: "underground conduit", 39004: "lake/pond (perennial)",
+         39009: "lake/pond (intermittent)", 43600: "reservoir"}
+
+
+def _kind(p: dict[str, Any]) -> str:
+    try:
+        fc = int(p.get("fcode") or 0)
+    except (TypeError, ValueError):
+        fc = 0
+    if fc in FCODE:
+        return FCODE[fc]
+    try:
+        return FTYPE.get(int(p.get("ftype") or 0), str(p.get("ftype")))
+    except (TypeError, ValueError):
+        return str(p.get("ftype"))
 HA_TO_AC = 2.47105
 
 
@@ -137,7 +155,7 @@ async def outlets(field: Field, client: httpx.AsyncClient, search_m: float = 200
         near = g.interpolate(g.project(fc)) if g.geom_type == "LineString" else g.representative_point()
         ang = (math.degrees(math.atan2(near.x - fc.x, near.y - fc.y)) + 360) % 360
         direction = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][int((ang + 22.5) // 45) % 8]
-        cands.append({"name": p.get("gnis_name") or None, "kind": FTYPE.get(int(p.get("ftype") or 0), str(p.get("ftype"))),
+        cands.append({"name": p.get("gnis_name") or None, "kind": _kind(p),
                       "fcode": p.get("fcode"), "distance_m": round(float(d)), "direction": direction,
                       "touches_field": bool(d < 1.0)})
     cands.sort(key=lambda c: c["distance_m"])
@@ -151,7 +169,7 @@ async def outlets(field: Field, client: httpx.AsyncClient, search_m: float = 200
         if inter.is_empty:
             continue
         p = {k.lower(): v for k, v in (f.get("properties") or {}).items()}
-        inside.append({"name": p.get("gnis_name") or None, "kind": FTYPE.get(int(p.get("ftype") or 0), str(p.get("ftype"))),
+        inside.append({"name": p.get("gnis_name") or None, "kind": _kind(p),
                        "ha_in_field": round(inter.area / 10_000, 2)})
     nearest = cands[0] if cands else None
     if nearest is None:

@@ -70,6 +70,14 @@ MIN_PIXEL_COVER = 0.5
 SAR_WATER_DB, SAR_REL_DB = -17.0, -5.0
 UPSCALE = 3
 NONCROP_MAX_NDVI = 0.45    # never above this in any season = not a crop pixel (lane, yard, water)
+# Field-scale split guard. Wet spots are patches; a planting-date or variety difference (or a merged
+# neighbour with the same CDL class) shows as one big block of the field reading "stressed" on a
+# pass. When that happens the block is referenced to its own median for that pass.
+SPLIT_MIN_SHARE = 0.22     # pass checked only when this share of the established crop reads stressed
+SPLIT_BLOCK_OF_STRESS = 0.60   # ...and one connected block holds this share of the stressed pixels
+SPLIT_BLOCK_OF_FIELD = 0.20    # ...and that block is at least a fifth of the field (a pothole complex is rarely that big)
+SPLIT_MIN_SOLIDITY = 0.65      # ...and the block is solid (area / convex hull), not a lacy cluster of wet patches
+SPLIT_MIN_EDGE_SHARE = 0.35    # ...and a good part of its rim is the field boundary (a half, a strip, a merged neighbour), unlike a pothole
 
 S2_EVALSCRIPT = """
 //VERSION=3
@@ -324,6 +332,59 @@ def _class_medians(band: np.ndarray, veg: np.ndarray, classes: np.ndarray | None
     return ref, field_med
 
 
+def _largest_block(mask: np.ndarray) -> tuple[np.ndarray, float]:
+    """Largest 4-connected block of True pixels, holes filled, as a mask, plus its solidity (area
+    over convex hull area). A late-planted half or a merged neighbour is one solid block (solidity 0.7+);
+    scattered wet-year stress that happens to touch is lacy (under 0.5). rasterio polygonise, no scipy."""
+    from rasterio.features import rasterize
+    best, best_area = None, 0.0
+    for geom, _ in shapes(mask.astype("uint8"), mask=mask, connectivity=4):
+        a = shape(geom).area  # identity transform: area in pixels
+        if a > best_area:
+            best, best_area = geom, a
+    if best is None:
+        return np.zeros(mask.shape, dtype=bool), 0.0
+    g = shape({"type": "Polygon", "coordinates": [best["coordinates"][0]]})  # exterior ring: holes filled
+    solidity = float(g.area / g.convex_hull.area) if g.convex_hull.area > 0 else 0.0
+    return rasterize([(mapping(g), 1)], out_shape=mask.shape, fill=0, dtype="uint8").astype(bool), solidity
+
+
+LOCAL_REF_PX = 25          # ~250 m box: local reference so a bimodal field (two planting dates) does not dilute real spots
+LOCAL_REF_MIN_PX = 40
+
+
+def _local_mean(band: np.ndarray, valid: np.ndarray, k: int = LOCAL_REF_PX) -> np.ndarray:
+    """Mean of valid pixels in a k x k box around each pixel (NaN where too few). Box filter by
+    cumulative sums; no scipy."""
+    k = max(3, min(k, min(band.shape)) | 1)
+    pad = k // 2
+    v = np.where(valid, band, 0.0).astype("float64")
+    c = valid.astype("float64")
+
+    def box(a: np.ndarray) -> np.ndarray:
+        ap = np.pad(a, pad)
+        cs = np.cumsum(np.cumsum(ap, axis=0), axis=1)
+        cs = np.pad(cs, ((1, 0), (1, 0)))
+        return cs[k:, k:] - cs[:-k, k:] - cs[k:, :-k] + cs[:-k, :-k]
+
+    n = box(c)
+    with np.errstate(all="ignore"):
+        m = np.where(n >= LOCAL_REF_MIN_PX, box(v) / np.maximum(n, 1), np.nan)
+    return m.astype("float32")
+
+
+def _rim(mask: np.ndarray) -> np.ndarray:
+    """Pixels of mask with at least one 4-neighbour outside the mask (array edge counts as outside)."""
+    inner = mask.copy()
+    inner[1:, :] &= mask[:-1, :]
+    inner[:-1, :] &= mask[1:, :]
+    inner[:, 1:] &= mask[:, :-1]
+    inner[:, :-1] &= mask[:, 1:]
+    inner[0, :] = inner[-1, :] = False
+    inner[:, 0] = inner[:, -1] = False
+    return mask & ~inner
+
+
 def _season_stress(arr: np.ndarray, dates: list[dt.date], field_mask: np.ndarray, spring: list[int],
                    classes: np.ndarray | None = None, codes: bool = True) -> dict[str, Any] | None:
     """Per-pixel stress days, optical ponding share and legacy max statistic for one season."""
@@ -335,6 +396,8 @@ def _season_stress(arr: np.ndarray, dates: list[dt.date], field_mask: np.ndarray
     pond_obs = np.zeros((h, w), dtype="float32")
     season_max = np.full((h, w), np.nan, dtype="float32")
     used_dates: list[tuple[str, float, float]] = []
+    split_passes: list[str] = []
+    field_rim = _rim(field_mask)
     order = np.argsort([d.toordinal() for d in dates])
     dates_sorted = [dates[i] for i in order]
     for k, i in enumerate(order):
@@ -355,11 +418,32 @@ def _season_stress(arr: np.ndarray, dates: list[dt.date], field_mask: np.ndarray
         if veg.sum() < 0.3 * n_field:
             continue
         ref, med = _class_medians(band, veg, classes, codes)
+        # Local reference: a pixel is also judged against its own ~250 m neighbourhood, and the higher of
+        # the two references counts. Keeps a wet spot visible inside the better half of a field that was
+        # planted on two dates, and stops a smooth fertility gradient reading as stress.
+        loc = _local_mean(band, veg)
+        ref = np.where(np.isfinite(loc), np.maximum(ref, loc), ref).astype("float32")
         season_max = np.where(veg, np.fmax(np.nan_to_num(season_max, nan=-2.0), band), season_max)
         established = clear & (ref >= CROP_MIN_NDVI)   # crop at full canopy for this pixel's own class
         if established.sum() < 0.3 * n_field:
             continue
         stressed = veg & established & (band < ref - STRESS_DELTA)
+        n_est = int(established.sum())
+        soft = veg & established & (band < ref - STRESS_DELTA / 2)   # half-threshold: catches a 50/50 split too
+        if soft.sum() > SPLIT_MIN_SHARE * n_est:
+            block, solidity = _largest_block(soft)
+            nb = int(block.sum())
+            rim = _rim(block)
+            edge_share = float((rim & field_rim).sum() / max(1, rim.sum()))  # how much of the block sits on the fence line
+            if (nb >= SPLIT_BLOCK_OF_STRESS * int(soft.sum()) and nb >= SPLIT_BLOCK_OF_FIELD * n_field
+                    and solidity >= SPLIT_MIN_SOLIDITY and edge_share >= SPLIT_MIN_EDGE_SHARE):
+                # One block of the field is behind as a whole: planting date, variety or a merged
+                # neighbour, not water. Reference the block to its own median for this pass.
+                ref = ref.copy()
+                ref[block] = float(np.median(band[veg & block]))
+                established = clear & (ref >= CROP_MIN_NDVI)
+                stressed = veg & established & (band < ref - STRESS_DELTA)
+                split_passes.append(d.isoformat())
         stressed |= water & established  # standing water on an established crop is stress too
         obs_days[established] += span
         stress_days[stressed] += span
@@ -376,7 +460,7 @@ def _season_stress(arr: np.ndarray, dates: list[dt.date], field_mask: np.ndarray
     legacy_low = np.where(np.isnan(season_max), np.nan, (season_max < med_max - LEGACY_LOW_DELTA).astype("float32"))
     return {
         "stress_days": stress_days_scaled, "pond": pond_share, "legacy_low": legacy_low, "season_max": season_max,
-        "passes_used": len(used_dates), "window_days": round(window),
+        "passes_used": len(used_dates), "window_days": round(window), "split_passes": split_passes,
         "mean_stress_days": round(float(np.nanmean(stress_days_scaled[field_mask])), 1),
         "worst_pass": max(used_dates, key=lambda x: x[2]),
         "legacy_low_share": round(float(np.nanmean(legacy_low[field_mask])), 3),
@@ -478,6 +562,7 @@ async def get_zones(field: Field, start_year: int = 2019) -> dict[str, Any]:
         row = {"year": y, "optical_passes_used": st["passes_used"], "window_days": st["window_days"],
                "reference": "CDL crop classes" if y in classes_by_year else ("management units" if units is not None else "whole field"),
                "mean_stress_days": st["mean_stress_days"], "optical_pond_share": st["optical_pond_share"],
+               "split_passes": st.get("split_passes") or [],
                "worst_pass": {"date": st["worst_pass"][0], "field_median_ndvi": st["worst_pass"][1],
                               "stressed_share": st["worst_pass"][2]},
                "legacy_low_share_max_method": st["legacy_low_share"]}

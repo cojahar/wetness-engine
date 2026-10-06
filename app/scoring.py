@@ -38,8 +38,15 @@ def score(soil: dict[str, Any], terrain: dict[str, Any], weather: dict[str, Any]
     # Terrain. A depression only holds water if the soil under it is slow, so on soils
     # SSURGO calls well drained (glacial outwash kettles, sandy ridges) terrain counts for less.
     if terrain and "depression_share" in terrain:
-        v = _clamp(terrain["depression_share"] * 2 + terrain["low_relative_share"]) \
-            * (0.6 if terrain["mean_slope_pct"] < 0.5 else 1.0)  # flat ground: DEM less trustworthy
+        lidar = float(terrain.get("depression_threshold_m", 0.3)) <= 0.2
+        if lidar:
+            # LiDAR at 5 m with a 0.15 m threshold counts only real closed basins, so a small share is a
+            # strong signal: 3.6% of a Des Moines Lobe pothole field (max depth 1.2 m) must not read 0.15.
+            # 8% of the field in basins -> 1.0; low relative ground counts double. Flat ground is trusted.
+            v = _clamp(terrain["depression_share"] / 0.08 + terrain["low_relative_share"] * 2)
+        else:
+            v = _clamp(terrain["depression_share"] * 2 + terrain["low_relative_share"]) \
+                * (0.6 if terrain["mean_slope_pct"] < 0.5 else 1.0)  # flat ground: 30 m DEM less trustworthy
         soil_factor = 1.0
         basis = f"{terrain.get('source', 'DEM')}: depressions and low relative ground"
         if ss:
@@ -101,8 +108,9 @@ def score(soil: dict[str, Any], terrain: dict[str, Any], weather: dict[str, Any]
         return {"score": None, "confidence": "none", "components": parts}
     s = sum(weights[k] * parts[k]["value"] for k in parts) / total_w * 100
     confidence = "high" if total_w >= 0.95 and "ssurgo" in soil else "medium" if total_w >= 0.65 else "low"
-    if terrain.get("mean_slope_pct", 1) < 0.5 and confidence == "high":
-        confidence = "medium"  # very flat: DEM depressions unreliable
+    if (terrain.get("mean_slope_pct", 1) < 0.5 and confidence == "high"
+            and float(terrain.get("depression_threshold_m", 0.3)) > 0.2):
+        confidence = "medium"  # very flat on a 30 m DEM: depressions unreliable (LiDAR is fine)
     label = "likely poorly drained" if s >= 60 else "possible drainage limitation" if s >= 35 else "no strong wetness signal"
     return {
         "score": round(s, 1),
