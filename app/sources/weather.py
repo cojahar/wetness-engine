@@ -82,7 +82,10 @@ def summarise(raw: dict[str, Any], lat: float) -> dict[str, Any]:
     et0 = daily.get("et0_fao_evapotranspiration") or []
 
     northern = lat >= 0
-    seasons: dict[str, dict[str, float]] = defaultdict(lambda: {"rain_mm": 0.0, "et0_mm": 0.0, "days": 0})
+    seasons: dict[str, dict[str, float]] = defaultdict(lambda: {"rain_mm": 0.0, "et0_mm": 0.0, "days": 0,
+                                                                 "spring_rain_mm": 0.0, "spring_et0_mm": 0.0})
+    # Planting-window months: when excess water does the damage (planting delay, ponded seedlings)
+    spring_months = (4, 5, 6) if northern else (5, 6, 7)
     for d, pi, ei in zip(dates, p, et0):
         if northern:
             if 4 <= d.month <= 9:
@@ -100,6 +103,9 @@ def summarise(raw: dict[str, Any], lat: float) -> dict[str, Any]:
         s["rain_mm"] += pi or 0.0
         s["et0_mm"] += ei or 0.0
         s["days"] += 1
+        if d.month in spring_months:
+            s["spring_rain_mm"] += pi or 0.0
+            s["spring_et0_mm"] += ei or 0.0
 
     # Drop partial seasons (fewer than 150 of ~183 days).
     full = {k: v for k, v in seasons.items() if v["days"] >= 150}
@@ -111,8 +117,13 @@ def summarise(raw: dict[str, Any], lat: float) -> dict[str, Any]:
     for v in full.values():
         v["rain_z"] = round((v["rain_mm"] - mean) / sd, 2)
         v["balance_mm"] = round(v["rain_mm"] - v["et0_mm"], 1)
+        v["spring_balance_mm"] = round(v["spring_rain_mm"] - v["spring_et0_mm"], 1)
         v["rain_mm"] = round(v["rain_mm"], 1)
         v["et0_mm"] = round(v["et0_mm"], 1)
+        v["spring_rain_mm"] = round(v["spring_rain_mm"], 1)
+        v["spring_et0_mm"] = round(v["spring_et0_mm"], 1)
+    spring_rain_mean = sum(v["spring_rain_mm"] for v in full.values()) / len(full)
+    spring_bal_mean = sum(v["spring_balance_mm"] for v in full.values()) / len(full)
     wet = sorted([k for k, v in full.items() if v["rain_z"] >= 0.5])
     dry = sorted([k for k, v in full.items() if v["rain_z"] <= -0.5])
 
@@ -127,6 +138,9 @@ def summarise(raw: dict[str, Any], lat: float) -> dict[str, Any]:
     return {
         "seasons": dict(sorted(full.items())),
         "season_rain_mean_mm": round(mean, 1),
+        "spring_rain_mean_mm": round(spring_rain_mean, 1),
+        "spring_balance_mean_mm": round(spring_bal_mean, 1),
+        "spring_months": list(spring_months),
         "wet_seasons": wet,
         "dry_seasons": dry,
         "rain_events": events,

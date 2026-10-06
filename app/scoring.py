@@ -12,7 +12,7 @@ WEIGHTS = {
     "soil": 0.30,       # drainage class / clay
     "terrain": 0.20,    # depressions and low relative ground
     "satellite": 0.35,  # wet-year NDVI penalty, unevenness, standing water, SAR
-    "climate": 0.15,    # rain minus ET in the growing season
+    "climate": 0.15,    # planting-window rain
 }
 
 
@@ -41,7 +41,7 @@ def score(soil: dict[str, Any], terrain: dict[str, Any], weather: dict[str, Any]
         v = _clamp(terrain["depression_share"] * 2 + terrain["low_relative_share"]) \
             * (0.6 if terrain["mean_slope_pct"] < 0.5 else 1.0)  # flat ground: DEM less trustworthy
         soil_factor = 1.0
-        basis = "Copernicus 30 m depressions and low relative ground"
+        basis = f"{terrain.get('source', 'DEM')}: depressions and low relative ground"
         if ss:
             poor = ss["poorly_drained_component_share"]
             soil_factor = 1.0 if poor >= 0.5 else 0.6 if poor > 0 else 0.3
@@ -49,12 +49,21 @@ def score(soil: dict[str, Any], terrain: dict[str, Any], weather: dict[str, Any]
                 basis += f"; damped x{soil_factor} because SSURGO soils are mostly well drained"
         parts["terrain"] = {"value": round(v * soil_factor, 2), "basis": basis}
 
-    # Climate
+    # Climate: how wet the planting window is. Whole-season rain minus ET0 is negative across the
+    # entire Corn Belt (summer ET wins), so it read 0.0 everywhere and only dragged scores down.
+    # Spring (Apr-Jun north, May-Jul south) rain is what delays planting and drowns seedlings:
+    # 150 mm -> 0, 350 mm -> 1 (central Iowa ~300 mm, western Nebraska ~180, central Illinois ~320).
     seasons = weather.get("seasons") or {}
-    if seasons:
+    if seasons and weather.get("spring_rain_mean_mm") is not None:
+        sr = float(weather["spring_rain_mean_mm"])
+        v = _clamp((sr - 150.0) / 200.0)
+        parts["climate"] = {"value": round(v, 2),
+                            "basis": f"mean planting-window (months {weather.get('spring_months')}) rain {sr:.0f} mm; "
+                                     f"spring rain minus ET0 {weather.get('spring_balance_mean_mm', 0):+.0f} mm"}
+    elif seasons:
         bal = [s["balance_mm"] for s in seasons.values()]
         mean_bal = sum(bal) / len(bal)
-        v = _clamp((mean_bal + 100) / 300)  # -100 mm -> 0, +200 mm -> 1
+        v = _clamp((mean_bal + 100) / 300)
         parts["climate"] = {"value": round(v, 2), "basis": f"mean growing-season rain minus ET0 {mean_bal:.0f} mm"}
 
     # Satellite
