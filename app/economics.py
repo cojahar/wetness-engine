@@ -91,9 +91,10 @@ def estimate(area_ha: float, score: float | None, zones: dict[str, Any] | None,
     """Screening economics for tiling this field. All money in USD, areas reported in both ha and ac.
 
     symptoms: {"satellite": 0-1 satellite component of the score, "stress_days": field mean stress
-    days per season, "tile_label": AgTile-US label}. Poorly drained soil only pays for tile when the
-    field is still undrained; the symptoms say whether it is, so the whole-field gain is scaled by
-    them and by the public tile map.
+    days per season, "soil": 0-1 soil component, "pond": spring ponding share, "tile_label": AgTile-US
+    label}. Poorly drained soil only pays for tile when the field is still undrained; the symptoms say
+    whether it is, so the whole-field gain is scaled by them and by the public tile map. Stress on
+    well-drained soil with no ponding is probably not water, so zone gains are capped there.
     """
     overrides = overrides or {}
     symptoms = symptoms or {}
@@ -136,6 +137,9 @@ def estimate(area_ha: float, score: float | None, zones: dict[str, Any] | None,
     # sand knobs, compaction or pests as well as water, so zone gains are scaled by how
     # plausible wetness is on this field: full weight from score 50 up, a quarter below 15.
     plausibility = max(0.25, min(1.0, (s - 15.0) / 35.0))
+    soil_v0 = symptoms.get("soil")
+    if soil_v0 is not None and float(soil_v0) < 0.15 and float(symptoms.get("pond") or 0.0) < 0.05:
+        plausibility = min(plausibility, 0.1)  # well-drained soil, no ponding: zone stress is probably not water
     gain_frac = (ps * a.problem_zone_gain + ws * a.watch_zone_gain) * plausibility + rest * a.whole_field_gain
     if not zones_known:
         gain_frac = a.whole_field_gain  # no map: rely on the field score alone
@@ -154,7 +158,13 @@ def estimate(area_ha: float, score: float | None, zones: dict[str, Any] | None,
             "yield_gain_pct_whole_field": round(gain_frac * mult * 100, 1),
         }
 
-    if tile_label == "appears tiled" and ps < 0.03 and symptom < 0.4:
+    soil_v = symptoms.get("soil")
+    pond = float(symptoms.get("pond") or 0.0)
+    well_drained = soil_v is not None and float(soil_v) < 0.15 and pond < 0.05
+    if well_drained and (ps >= 0.05 or symptom >= 0.5):
+        status = ("crop stress shows on the imagery but the soil survey rates this ground well drained and no ponding was seen: "
+                  "more likely compaction, fertility, sand or a crop difference than excess water; walk it before quoting tile")
+    elif tile_label == "appears tiled" and ps < 0.03 and symptom < 0.4:
         status = "looks drained already: little symptom of excess water and the public tile map says tiled; any case for tile is the mapped wet spots"
     elif symptom_known and symptom < 0.25 and ps < 0.03:
         status = "few symptoms of excess water on the imagery; the soil may be wet by nature but the field is coping"
@@ -186,6 +196,8 @@ def estimate(area_ha: float, score: float | None, zones: dict[str, Any] | None,
             f"Whole-field gain from the soil score is scaled by how much excess-water symptom the imagery shows "
             f"(x{symptom_factor:.2f}) and by the public tile map (x{tile_factor:.2f}): poorly drained soil only pays "
             f"for tile when the field is still undrained",
+            f"Zone gains are weighted by how plausible wetness is on this field (x{plausibility:.2f}); on soil the survey "
+            f"rates well drained with no ponding seen, crop stress is treated as probably not water",
             "Install cost: Midwest contractor bids $800-1,500/ac (2017 forum data, inflated to a $1,200/ac default). "
             "Own-plow cost is a placeholder for the dealer to replace",
             "Prices: 2 Oct 2026 futures corn $4.99, soybeans $12.77, wheat $6.86; cash defaults net of ~$0.40 basis",
