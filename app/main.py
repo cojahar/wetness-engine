@@ -22,7 +22,7 @@ from .geo import parse_field, square_around
 from .scoring import score
 from .sources import boundary, dem, hydro, sentinel, soil, tile, weather, zones
 
-app = FastAPI(title="Farm X wetness engine", version="0.6.4")
+app = FastAPI(title="Farm X wetness engine", version="0.6.5")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 

@@ -121,7 +121,15 @@ def estimate(area_ha: float, score: float | None, zones: dict[str, Any] | None,
     s = float(score or 0.0)
     sat = symptoms.get("satellite")
     sd = symptoms.get("stress_days")
-    symptom = max(float(sat) if sat is not None else 0.0, min(1.0, float(sd) / 20.0) if sd is not None else 0.0)
+    # Stress days from the 10 m zone map are the direct measure (every pass, every season); the field-level
+    # satellite component mixes in unevenness and radar that read high on variable soils even when the
+    # crop is fine, so when both exist the zone map carries most of the weight.
+    sat_v = float(sat) if sat is not None else None
+    sd_v = min(1.0, float(sd) / 20.0) if sd is not None else None
+    if sat_v is not None and sd_v is not None:
+        symptom = 0.3 * sat_v + 0.7 * sd_v
+    else:
+        symptom = sat_v if sat_v is not None else (sd_v or 0.0)
     symptom_known = sat is not None or sd is not None
     symptom_factor = max(0.15, min(1.0, symptom / 0.5)) if symptom_known else 1.0
     tile_label = str(symptoms.get("tile_label") or "")
