@@ -151,6 +151,16 @@ def _findings(res: dict[str, Any]) -> list[str]:
     elif cc.get("tiled_share_of_cropland") is not None:
         out.append(f"In {cc.get('county')} County the 2022 Census of Agriculture reports "
                    f"{cc['tiled_share_of_cropland']:.0%} of cropland as tile drained.")
+    hy = res.get("hydro") or {}
+    wl = hy.get("wetlands") or {}
+    if wl.get("mapped_wetland_ha", 0) > 0:
+        kinds = ", ".join(f"{k.lower()} {v * HA_TO_AC:.1f} ac" for k, v in list((wl.get("by_type_ha") or {}).items())[:3])
+        out.append(f"The National Wetlands Inventory maps {wl['mapped_wetland_ac']:.1f} ac of this field as wetland "
+                   f"({kinds}). Draining a mapped wetland can trip Swampbuster: get an NRCS wetland determination "
+                   f"before tiling those spots.")
+    ol = hy.get("outlets") or {}
+    if ol.get("verdict"):
+        out.append(f"Outlet: {ol['verdict']}.")
     ds = (res.get("economics") or {}).get("drainage_status")
     if ds:
         out.append(f"Bottom line: {ds}.")

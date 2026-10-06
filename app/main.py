@@ -20,9 +20,9 @@ from . import economics, jobs, report, store, validate
 from .config import settings
 from .geo import parse_field, square_around
 from .scoring import score
-from .sources import boundary, dem, sentinel, soil, tile, weather, zones
+from .sources import boundary, dem, hydro, sentinel, soil, tile, weather, zones
 
-app = FastAPI(title="Farm X wetness engine", version="0.6.1")
+app = FastAPI(title="Farm X wetness engine", version="0.6.3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -70,6 +70,7 @@ async def _run(field, with_zones: bool = True, crop_sequence: list[str] | None =
         guarded("sentinel", sentinel.get_sentinel(field.geojson(), lat)),
         guarded("zones", zones.get_zones(field) if with_zones else _none()),
         guarded("tile", tile.get_tile(field)),
+        guarded("hydro", hydro.get_hydro(field)),
     )
     data = {name: val for name, val, _ in results}
     errors = {name: err for name, _, err in results if err}
@@ -78,6 +79,8 @@ async def _run(field, with_zones: bool = True, crop_sequence: list[str] | None =
     comps = wet.get("components") or {}
     symptoms = {"satellite": (comps.get("satellite") or {}).get("value"),
                 "stress_days": (data["zones"] or {}).get("field_mean_stress_days_per_season"),
+                "soil": (comps.get("soil") or {}).get("value"),
+                "pond": (data["zones"] or {}).get("field_spring_ponding_share"),
                 "tile_label": ((data["tile"] or {}).get("agtile") or {}).get("label")}
     try:
         econ = economics.estimate(field.area_ha, wet.get("score"), data["zones"], crop_sequence, econ_overrides, symptoms)
@@ -94,6 +97,7 @@ async def _run(field, with_zones: bool = True, crop_sequence: list[str] | None =
         "sentinel": data["sentinel"],
         "zones": data["zones"],
         "existing_tile": data["tile"],
+        "hydro": data["hydro"],
         "errors": errors,
         "elapsed_s": round(time.time() - t0, 1),
         "engine_version": app.version,
@@ -115,13 +119,13 @@ async def analyze(req: AnalyzeRequest, x_api_key: str | None = Header(default=No
 
 @app.get("/boundary")
 async def get_boundary(lat: float, lon: float, x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
-    """Snap a pin to a field boundary (Fields of The World at 10 m, else the USDA CDL flood fill)."""
+    """Snap a pin to a field boundary (USA only, from the USDA Cropland Data Layer)."""
     _auth(x_api_key)
     try:
         snap = await boundary.snap_to_field(lon, lat)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"boundary service failed: {type(e).__name__}: {str(e)[:200]}")
-    return snap or {"found": False, "reason": "no field boundary or CDL coverage here"}
+    return snap or {"found": False, "reason": "no CDL coverage here (outside the contiguous US?)"}
 
 
 @app.get("/analyze/point")
@@ -131,8 +135,8 @@ async def analyze_point(lat: float, lon: float, side_m: float = 400, name: str |
                         yield_per_ac: float | None = None,
                         x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
     """Start an analysis from a pin. With snap=true (default) the pin is first snapped to a
-    field boundary (Fields of The World, else the USDA Cropland Data Layer); if that fails
-    a square of side_m metres centred on the pin is used instead.
+    field boundary from the USDA Cropland Data Layer; if that fails (outside the US, or not
+    cropland) a square of side_m metres centred on the pin is used instead.
     Optional economics overrides: install_cost_per_ac, own_plow_cost_per_ac, price_per_unit, yield_per_ac.
     Returns a job id at once; fetch the result from /jobs/{id}."""
     _auth(x_api_key)
@@ -224,7 +228,7 @@ async def zones_polygon(req: AnalyzeRequest, x_api_key: str | None = Header(defa
 @app.get("/zones/point")
 async def zones_point(lat: float, lon: float, side_m: float = 400, name: str | None = None,
                       x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
-    """Zone map from a pin: snaps to a field boundary, else a square. Runs as a job."""
+    """Zone map from a pin: snaps to a CDL field boundary (US), else a square. Runs as a job."""
     _auth(x_api_key)
     label = name or f"zones {lat:.4f},{lon:.4f}"
 
