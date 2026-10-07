@@ -65,3 +65,23 @@ def index() -> list[dict[str, Any]]:
     if not enabled():
         return []
     return _get_json(_INDEX_KEY) or []
+
+
+_SIGNUPS_KEY = "pilot/signups.json"
+
+
+def add_signup(entry: dict[str, Any]) -> int:
+    """Append a pilot sign-up (name, contact, county, notes). Blocking; call from a thread. Returns the count."""
+    if not enabled():
+        return 0
+    with _lock:
+        rows = _get_json(_SIGNUPS_KEY) or []
+        rows.append(entry)
+        _put_json(_SIGNUPS_KEY, rows[-2000:])
+        return len(rows)
+
+
+def signups() -> list[dict[str, Any]]:
+    if not enabled():
+        return []
+    return _get_json(_SIGNUPS_KEY) or []

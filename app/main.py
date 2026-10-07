@@ -22,7 +22,7 @@ from .geo import parse_field, square_around
 from .scoring import score
 from .sources import boundary, dem, hydro, sentinel, soil, tile, weather, zones
 
-app = FastAPI(title="Farm X wetness engine", version="0.6.6")
+app = FastAPI(title="Farm X wetness engine", version="0.6.7")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -319,6 +319,28 @@ async def job_feedback(job_id: str, body: dict[str, Any], x_api_key: str | None 
     await asyncio.to_thread(jobs.update, job_id)
     print("FEEDBACK", json.dumps({"id": job_id, **{k: v for k, v in entry.items() if k != "received_at"}})[:1500], flush=True)
     return {"ok": True, "count": len(res["feedback"])}
+
+
+@app.post("/pilot/signup")
+async def pilot_signup(body: dict[str, Any]) -> dict[str, Any]:
+    """Pilot sign-up form from the public landing page. No API key: the page is public. Stored in the
+    bucket at pilot/signups.json; Cody sends the private invite link by hand. Light abuse guard only."""
+    if not isinstance(body, dict) or not body:
+        raise HTTPException(status_code=422, detail="send a JSON object")
+    entry = {k: str(v)[:500] for k, v in list(body.items())[:12] if v is not None}
+    if not (entry.get("contact") or entry.get("email") or entry.get("phone")):
+        raise HTTPException(status_code=422, detail="an email or phone is needed so we can send the link")
+    entry["received_at"] = dt.datetime.utcnow().isoformat() + "Z"
+    n = await asyncio.to_thread(store.add_signup, entry)
+    print("SIGNUP", json.dumps(entry)[:600], flush=True)
+    return {"ok": True, "count": n}
+
+
+@app.get("/pilot/signups")
+async def pilot_signups(x_api_key: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    """The sign-up list, for Cody (needs the API key once one is set)."""
+    _auth(x_api_key)
+    return await asyncio.to_thread(store.signups)
 
 
 class ReportRequest(BaseModel):
