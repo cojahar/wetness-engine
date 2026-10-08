@@ -27,7 +27,7 @@ HA_PER_AC = 0.404686
 # bu/ac typical for drained Midwest ground, and cash $/bu
 CROPS: dict[str, dict[str, float]] = {
     "corn": {"yield": 190.0, "price": 4.60, "response": 1.0},
-    "soybeans": {"yield": 58.0, "price": 12.30, "response": 0.6},
+    "soybeans": {"yield": 58.0, "price": 12.30, "response": 1.4},   # TD plots: soybeans gain more than corn (12.4% vs 8.2% median)
     "spring wheat": {"yield": 55.0, "price": 6.40, "response": 0.6},
     "winter wheat": {"yield": 75.0, "price": 6.00, "response": 0.6},
     "durum wheat": {"yield": 50.0, "price": 7.50, "response": 0.6},
@@ -58,19 +58,27 @@ class Assumptions:
     problem_zone_gain: float = 0.40      # share of yield recovered on persistent wet spots
     watch_zone_gain: float = 0.15
     whole_field_gain: float = 0.0        # from the wetness score and crop response
-    scenario_multipliers: tuple[float, float, float] = (0.6, 1.0, 1.4)
+    scenario_multipliers: tuple[float, float, float] = (0.4, 1.0, 1.8)   # dry year / typical / wet year, from the TD plot spread
 
 
 def _whole_field_gain(score: float, response: float) -> float:
-    """Expected whole-field yield gain (fraction) outside the mapped zones, from the
-    field-level wetness score: nothing below 20, 15% at 60, 25% at 80 and above, for corn
-    (Illinois case study: 20-35% on fields that needed tile)."""
+    """Expected whole-field yield gain (fraction) outside the mapped zones, from the field-level
+    wetness score: nothing below 20, 8% at 60, 14% at 80 and above, for corn.
+
+    Calibrated 8 Oct 2026 on the Transforming Drainage research database (CC BY 4.0): paired
+    drained vs non-drained plots on poorly drained soils, 44 corn site-years and 31 soybean
+    site-years across Iowa (Taintor), Missouri claypan (Putnam, Blackoar) and the Red River
+    valley. Corn gain median 8.2% (mean 11.5%; Iowa 4%, claypan 7-28%); soybeans median 12.4%
+    (mean 14%). Year to year the same plots swing from -5% in dry years to +30-50% in wet
+    years, which is what the low/mid/high scenarios carry. The old curve (15% at 60, 25% at
+    80, from an Illinois case study of fields chosen because they needed tile) was about twice
+    the measured research-plot average and is kept only as the "high" scenario."""
     if score <= 20:
         g = 0.0
     elif score <= 60:
-        g = 0.15 * (score - 20) / 40
+        g = 0.08 * (score - 20) / 40
     else:
-        g = 0.15 + 0.10 * min(score - 60, 20) / 20
+        g = 0.08 + 0.06 * min(score - 60, 20) / 20
     return round(g * response, 4)
 
 
@@ -197,7 +205,10 @@ def estimate(area_ha: float, score: float | None, zones: dict[str, Any] | None,
         "own_plow": {k: scenario(m, a.own_plow_cost_per_ac) for k, m in zip(("low", "mid", "high"), a.scenario_multipliers)},
         "assumptions": asdict(a),
         "evidence": [
-            "Illinois Extension case study (9 fields): corn >10% gain in years 1-3 after tiling, 20-35% in year 4",
+            "Transforming Drainage research database (USDA-NIFA, 39 Midwest sites, CC BY 4.0): drained vs undrained plots on poorly "
+            "drained soils gained a median 8% for corn and 12% for soybeans per year (Iowa Taintor 4%, Missouri claypan 7-28%), with "
+            "single wet years at +30-50% and dry years at -5%",
+            "Illinois Extension case study (9 fields): corn >10% gain in years 1-3 after tiling, 20-35% in year 4 (fields chosen because they needed tile; treated as the high case)",
             "Agricultural Water Management 2020, North Central US: soybeans +8% in trials, +4% on producer fields, "
             "partly from earlier sowing",
             "Persistent wet spots: 30-60% loss in wet years; 40% recovery assumed on problem zones, 15% on watch zones",
