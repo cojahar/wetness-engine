@@ -22,7 +22,7 @@ from .geo import parse_field, square_around
 from .scoring import score
 from .sources import boundary, dem, hydro, sentinel, soil, tile, weather, zones
 
-app = FastAPI(title="Farm X wetness engine", version="0.6.8")
+app = FastAPI(title="Farm X wetness engine", version="0.6.9")
 
 
 class AnalyzeRequest(BaseModel):
@@ -45,17 +45,24 @@ def _invite_codes() -> set[str]:
 
 @app.middleware("http")
 async def gate(request, call_next):
-    """One gate for everything. The API key opens every path. A pilot invite code (header X-Invite or
-    ?invite=) opens the farmer-facing paths. With neither configured the engine is open, as before."""
+    """One gate for everything. While PILOT_INVITE_CODES is set, farmer-facing paths need an invite code
+    (header X-Invite or ?invite=) and the API key only opens the admin paths; with no codes set the API
+    key (or nothing, when none is configured) opens everything, as before."""
     path = request.url.path
     key_ok = bool(settings.engine_api_key) and request.headers.get("x-api-key", "").strip() == settings.engine_api_key
-    if path in OPEN_PATHS or request.method == "OPTIONS" or key_ok:
-        return await call_next(request)
     codes = _invite_codes()
     invite = (request.headers.get("x-invite") or request.query_params.get("invite") or "").strip()
-    if path not in ADMIN_PATHS and codes and invite in codes:
+    if path in OPEN_PATHS or request.method == "OPTIONS":
         return await call_next(request)
-    if not settings.engine_api_key and not codes:
+    if path in ADMIN_PATHS:
+        if key_ok:
+            return await call_next(request)
+    elif codes:
+        # Pilot mode: every farmer-facing call needs an invite code, even from a caller that holds the
+        # API key (the website proxy sends the key on every request, so the key alone must not open it).
+        if invite in codes:
+            return await call_next(request)
+    elif key_ok or not settings.engine_api_key:
         return await call_next(request)
     from fastapi.responses import JSONResponse
     msg = "bad api key" if path in ADMIN_PATHS or not codes else "This tool is in a private pilot. A valid invite code is required."
