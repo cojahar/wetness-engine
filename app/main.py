@@ -22,8 +22,7 @@ from .geo import parse_field, square_around
 from .scoring import score
 from .sources import boundary, dem, hydro, sentinel, soil, tile, weather, zones
 
-app = FastAPI(title="Farm X wetness engine", version="0.6.7")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="Farm X wetness engine", version="0.6.8")
 
 
 class AnalyzeRequest(BaseModel):
@@ -32,8 +31,39 @@ class AnalyzeRequest(BaseModel):
 
 
 def _auth(x_api_key: str | None) -> None:
-    if settings.engine_api_key and x_api_key != settings.engine_api_key:
-        raise HTTPException(status_code=401, detail="bad api key")
+    """Kept for the endpoint signatures; the check itself lives in the gate middleware below."""
+    return None
+
+
+OPEN_PATHS = {"/health", "/pilot/signup", "/docs", "/openapi.json", "/redoc"}
+ADMIN_PATHS = {"/pilot/signups"}
+
+
+def _invite_codes() -> set[str]:
+    return {c.strip().strip("\"'") for c in (settings.pilot_invite_codes or "").split(",") if c.strip()}
+
+
+@app.middleware("http")
+async def gate(request, call_next):
+    """One gate for everything. The API key opens every path. A pilot invite code (header X-Invite or
+    ?invite=) opens the farmer-facing paths. With neither configured the engine is open, as before."""
+    path = request.url.path
+    key_ok = bool(settings.engine_api_key) and request.headers.get("x-api-key", "").strip() == settings.engine_api_key
+    if path in OPEN_PATHS or request.method == "OPTIONS" or key_ok:
+        return await call_next(request)
+    codes = _invite_codes()
+    invite = (request.headers.get("x-invite") or request.query_params.get("invite") or "").strip()
+    if path not in ADMIN_PATHS and codes and invite in codes:
+        return await call_next(request)
+    if not settings.engine_api_key and not codes:
+        return await call_next(request)
+    from fastapi.responses import JSONResponse
+    msg = "bad api key" if path in ADMIN_PATHS or not codes else "This tool is in a private pilot. A valid invite code is required."
+    return JSONResponse({"detail": msg}, status_code=401)
+
+
+# Added after the gate so CORS wraps it: a 401 still carries the CORS headers for browsers.
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/health")

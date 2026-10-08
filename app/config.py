@@ -19,6 +19,9 @@ class Settings(BaseSettings):
 
     # Optional shared secret so only our Supabase edge function can call /analyze.
     engine_api_key: str | None = None
+    # Comma-separated pilot invite codes. A request carrying one (X-Invite header or ?invite=) may use
+    # the farmer-facing endpoints; the API key is still needed for admin reads such as /pilot/signups.
+    pilot_invite_codes: str | None = None
 
     # Our own object storage (Railway bucket) holding hosted rasters such as cdl/<year>.tif.
     # When set, boundary snapping reads CDL windows from here instead of USDA's live service.
