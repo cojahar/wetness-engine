@@ -22,7 +22,7 @@ from .geo import parse_field, square_around
 from .scoring import score
 from .sources import boundary, dem, hydro, sentinel, soil, tile, weather, zones
 
-app = FastAPI(title="Farm X wetness engine", version="0.6.10")
+app = FastAPI(title="Farm X wetness engine", version="0.6.11")
 
 
 class AnalyzeRequest(BaseModel):
@@ -37,6 +37,7 @@ def _auth(x_api_key: str | None) -> None:
 
 OPEN_PATHS = {"/health", "/pilot/signup", "/docs", "/openapi.json", "/redoc"}
 ADMIN_PATHS = {"/pilot/signups"}
+ADMIN_PREFIX = "/admin"
 
 
 def _invite_codes() -> set[str]:
@@ -54,7 +55,7 @@ async def gate(request, call_next):
     invite = (request.headers.get("x-invite") or request.query_params.get("invite") or "").strip()
     if path in OPEN_PATHS or request.method == "OPTIONS":
         return await call_next(request)
-    if path in ADMIN_PATHS:
+    if path in ADMIN_PATHS or path.startswith(ADMIN_PREFIX):
         if key_ok:
             return await call_next(request)
     elif codes:
@@ -65,7 +66,8 @@ async def gate(request, call_next):
     elif key_ok or not settings.engine_api_key:
         return await call_next(request)
     from fastapi.responses import JSONResponse
-    msg = "bad api key" if path in ADMIN_PATHS or not codes else "This tool is in a private pilot. A valid invite code is required."
+    msg = ("bad api key" if path in ADMIN_PATHS or path.startswith(ADMIN_PREFIX) or not codes
+           else "This tool is in a private pilot. A valid invite code is required.")
     return JSONResponse({"detail": msg}, status_code=401)
 
 
@@ -378,6 +380,36 @@ async def pilot_signups(x_api_key: str | None = Header(default=None)) -> list[di
     """The sign-up list, for Cody (needs the API key once one is set)."""
     _auth(x_api_key)
     return await asyncio.to_thread(store.signups)
+
+
+@app.get("/admin/overview")
+async def admin_overview(x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+    """Everything the pilot produces, for the admin page: sign-ups, every job with its score, status,
+    yield-check verdict and farmer feedback. API key only."""
+    _auth(x_api_key)
+    signups = await asyncio.to_thread(store.signups)
+    jobs_list = jobs.summaries()
+    n_fb = sum(1 for j in jobs_list if j.get("feedback_count"))
+    n_yc = sum(1 for j in jobs_list if j.get("yield_checked"))
+    return {"generated_at": dt.datetime.utcnow().isoformat() + "Z", "engine_version": app.version,
+            "counts": {"signups": len(signups), "jobs": len(jobs_list),
+                       "jobs_done": sum(1 for j in jobs_list if j.get("status") == "done"),
+                       "with_feedback": n_fb, "with_yield_check": n_yc},
+            "signups": list(reversed(signups)), "jobs": jobs_list}
+
+
+@app.get("/admin/jobs/{job_id}")
+async def admin_job(job_id: str, x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+    """One job's feedback and yield check in full (the farmer-facing /jobs/{id} needs an invite)."""
+    _auth(x_api_key)
+    j = jobs.get(job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="no such job")
+    r = j.get("result") or {}
+    return {"id": job_id, "name": j.get("name"), "status": j.get("status"), "feedback": r.get("feedback") or [],
+            "yield_check": r.get("yield_check"), "boundary": {k: v for k, v in (r.get("boundary") or {}).items() if k != "geometry"},
+            "wetness": r.get("wetness"), "economics": {k: (r.get("economics") or {}).get(k) for k in ("expected_yield_gain_pct", "drainage_status", "symptoms")},
+            "field": r.get("field")}
 
 
 class ReportRequest(BaseModel):

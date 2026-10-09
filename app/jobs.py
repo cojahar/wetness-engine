@@ -73,6 +73,13 @@ def _summary(j: dict[str, Any]) -> dict[str, Any]:
             "problem_share": z.get("problem_share"), "expected_yield_gain_pct": e.get("expected_yield_gain_pct"),
             "own_plow_payback_years": ((e.get("own_plow") or {}).get("mid") or {}).get("simple_payback_years"),
             "yield_checked": bool(r.get("yield_check")),
+            "yield_verdict": (r.get("yield_check") or {}).get("verdict"),
+            "yield_r": (r.get("yield_check") or {}).get("correlation_stress_vs_yield"),
+            "feedback_count": len(r.get("feedback") or []),
+            "feedback_last": ((r.get("feedback") or [None])[-1]),
+            "drainage_status": e.get("drainage_status"),
+            "tile_label": (((r.get("existing_tile") or {}).get("agtile") or {}).get("label")),
+            "engine_version": r.get("engine_version"),
             "error": j.get("error")}
 
 
